@@ -22,14 +22,14 @@ gmessages-tui         # or `cargo run` from a checkout
 
 First run pairs with your phone, like *Sign in with Google* on Google Messages for web. gmessages-tui prints a link to a pairing page, served on this computer only:
 
-1. Sign in to the phone's Google account from it (a private window is best).
+1. Sign in to the phone's Google account from it, in a **Firefox private window**: Chrome binds its Google cookies to itself (DBSC), and Google then ends the session. Go nowhere else in that window.
 2. Developer tools (F12) › Network › reload › right-click the `config` request › *Copy as cURL*.
 3. Paste it into the page (or the terminal), then tap the emoji shown on your phone.
 4. Close the Google window **without signing out** (signing out ends the session).
 
 If Google ends the session anyway, gmessages-tui asks to sign in again: same steps, same account, no emoji this time.
 
-Only the Google cookies the protocol needs are kept, in the session. `gmessages-tui --qr` pairs by QR code instead (*Device pairing › QR code scanner*), if your phone offers it.
+Only the Google cookies the protocol needs are kept, in the session. `gmessages-tui --qr` pairs by QR code instead, for the phones that still offer it (Google is removing it).
 
 The phone stays the relay: keep it online.
 

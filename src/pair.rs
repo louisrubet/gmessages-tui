@@ -53,9 +53,10 @@ impl Pairing {
         let page = web::Page::serve(paste.clone()).await?;
         say(&format!(
             "{intro}: open\n\n  {}\n\n\
+             Sign in to Google in a Firefox private window (with Chrome, Google ends the session).\n\n\
              Or here: sign in to that account at {}, then in the developer tools (F12),\n\
              Network, reload, right-click the `config` request, Copy as cURL, and paste it here.\n\
-             \n(Esc or Ctrl+C to quit; `gmessages-tui --qr` pairs by QR code instead.)",
+             \n(Esc or Ctrl+C to quit; `--qr` pairs by QR code, if the phone still offers it.)",
             link(page.url()),
             link(SIGN_IN),
         ));

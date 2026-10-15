@@ -112,7 +112,7 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
             Some(gmd::Event::Qr { url }) => {
                 println!(
                     "Scan this QR code from Google Messages on your phone \
-                     (Device pairing > QR code scanner):"
+                     (Device pairing):"
                 );
                 chat_tui::qr::print_qr(&url);
             }

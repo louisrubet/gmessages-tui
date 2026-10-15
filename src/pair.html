@@ -43,8 +43,8 @@
 
   <ol id="steps">
     <li>
-      Sign in to your phone’s Google account. A private window is best: open this link in one.<br><br>
-      <a class="button" href="{SIGN_IN}" target="_blank" rel="noreferrer">Sign in to Google</a>
+      Sign in to your phone’s Google account, in a <b>Firefox private window</b>: copy this link into one. Not Chrome: it binds its Google cookies to itself, and Google then ends the session. Go nowhere else in that window.<br><br>
+      <a class="button" href="{SIGN_IN}" target="_blank" rel="noreferrer">Sign in to Google</a> <button id="copy" type="button">Copy the link</button>
     </li>
     <li>
       On the page it opens, <code>messages.google.com/web/config</code>: open the developer tools
@@ -92,6 +92,15 @@
   }
 
   button.addEventListener("click", pair);
+  const copy = document.getElementById("copy");
+  copy.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText("{SIGN_IN}");
+      copy.textContent = "Copied";
+    } catch (e) {
+      copy.textContent = "Right-click the button instead";
+    }
+  });
   curl.addEventListener("paste", () => setTimeout(pair, 0));
 
   let shown = "";
