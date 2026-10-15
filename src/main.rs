@@ -1,11 +1,12 @@
 //! gmessages-tui: a terminal client for Google Messages, paired with your Android phone
 //! like Google Messages for web.
 //!
-//!   gmessages-tui [--version]
+//!   gmessages-tui [--qr | --version]
 //!
 //! Not affiliated with Google.
 
 mod gmd;
+mod pair;
 
 use std::error::Error;
 use std::future::Future;
@@ -19,22 +20,31 @@ use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 const NAME: &str = "gmessages-tui";
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--version") {
-        println!("v{}", env!("CARGO_PKG_VERSION"));
-        return;
-    }
+    let qr = match std::env::args().nth(1).as_deref() {
+        None => false,
+        Some("--qr") => true,
+        Some("--version") => {
+            println!("v{}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        Some(_) => {
+            eprintln!("usage: {NAME} [--qr | --version]");
+            std::process::exit(2);
+        }
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("cannot create the Tokio runtime");
     let local = tokio::task::LocalSet::new();
-    if let Err(e) = runtime.block_on(local.run_until(run())) {
+    if let Err(e) = runtime.block_on(local.run_until(run(qr))) {
         eprintln!("{NAME}: {e}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> std::result::Result<(), Box<dyn Error>> {
+/// `qr`: pair by QR code rather than with the Google account, if pairing.
+async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
     let config = chat_tui::Config::new(NAME)?;
     let state = config.read_marks.parent().ok_or("no state directory")?;
     create_private_dir(state)?;
@@ -43,8 +53,31 @@ async fn run() -> std::result::Result<(), Box<dyn Error>> {
     // Until the phone sends the conversations: pairing, if needed, in the terminal.
     let conversations = loop {
         match gmd.next().await? {
+            Some(gmd::Event::Login) if qr => {
+                gmd.send(serde_json::json!({"cmd": "pair_qr"})).await?;
+            }
+            Some(gmd::Event::PairFailed { message }) if qr => {
+                return Err(format!("pairing failed: {message}").into());
+            }
+            Some(event @ (gmd::Event::Login | gmd::Event::PairFailed { .. })) => {
+                if let gmd::Event::PairFailed { message } = event {
+                    println!("Pairing failed: {message}\n");
+                }
+                let Some(cookies) = pair::ask_cookies()? else {
+                    return Ok(());
+                };
+                println!("Asking the phone\u{2026}");
+                let command = serde_json::json!({"cmd": "pair_google", "cookies": cookies});
+                gmd.send(command).await?;
+            }
+            Some(gmd::Event::Emoji { emoji }) => {
+                println!("\nOn your phone, Google Messages asks to confirm: tap   {emoji}\n");
+            }
             Some(gmd::Event::Qr { url }) => {
-                println!("Scan this QR code from Google Messages on your phone (Device pairing):");
+                println!(
+                    "Scan this QR code from Google Messages on your phone \
+                     (Device pairing > QR code scanner):"
+                );
                 chat_tui::qr::print_qr(&url);
             }
             Some(gmd::Event::Paired) => println!("Paired, loading the conversations\u{2026}"),

@@ -12,7 +12,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 1;
+const PROTOCOL: u32 = 2;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -21,9 +21,19 @@ pub enum Event {
     Hello {
         protocol: u32,
     },
+    /// No session: tell how to pair (`pair_google` or `pair_qr`).
+    Login,
     /// Scan this from the phone to pair.
     Qr {
         url: String,
+    },
+    /// Tap this emoji on the phone to pair.
+    Emoji {
+        emoji: String,
+    },
+    /// Pairing failed: try again.
+    PairFailed {
+        message: String,
     },
     Paired,
     Ready {
@@ -90,6 +100,14 @@ impl Gmd {
                 "gmd does not speak protocol {PROTOCOL}: {other:?}"
             ))),
         }
+    }
+
+    /// Sends a command.
+    pub async fn send(&mut self, command: serde_json::Value) -> io::Result<()> {
+        let mut line = command.to_string();
+        line.push('\n');
+        self.stdin.write_all(line.as_bytes()).await?;
+        self.stdin.flush().await
     }
 
     /// The next event, `None` once gmd has stopped.

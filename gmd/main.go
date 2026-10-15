@@ -2,8 +2,10 @@
 //
 //	gmd --session FILE [--log FILE]
 //
-// Speaks JSON lines: events on stdout, commands on stdin. Pairs with the phone by QR code
-// when FILE holds no session, and keeps the session in FILE.
+// Speaks JSON lines: events on stdout, commands on stdin. When FILE holds no session, says
+// "login" and pairs as told: with the Google account of the phone (cookies of a browser
+// signed in to it, then an emoji to tap on the phone), or by QR code. Keeps the session in
+// FILE.
 package main
 
 import (
@@ -16,6 +18,8 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
@@ -25,7 +29,10 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 1
+const protocol = 2
+
+// Conversations listed when the session becomes active.
+const conversationCount = 100
 
 // Conversation is a chat as gmessages-tui shows it.
 type Conversation struct {
@@ -42,6 +49,13 @@ type Latest struct {
 	Text   string `json:"text"`
 	FromMe bool   `json:"from_me"`
 	Sender string `json:"sender"`
+}
+
+// Command is what gmessages-tui asks.
+type Command struct {
+	Cmd string `json:"cmd"`
+	// For "pair_google": the cookies of a browser signed in to the Google account.
+	Cookies map[string]string `json:"cookies,omitempty"`
 }
 
 var (
@@ -74,6 +88,17 @@ func main() {
 	}
 }
 
+// gmd is the state: one client at a time (a failed pairing starts over with a new one).
+type gmd struct {
+	sessionPath string
+	logger      zerolog.Logger
+	ctx         context.Context
+
+	client  *libgm.Client
+	pairing atomic.Bool
+	ready   atomic.Bool
+}
+
 func run(sessionPath, logPath string) error {
 	logger := zerolog.Nop()
 	if logPath != "" {
@@ -82,7 +107,8 @@ func run(sessionPath, logPath string) error {
 			return err
 		}
 		defer file.Close()
-		logger = zerolog.New(file).With().Timestamp().Logger()
+		// Not trace: it logs the bodies, messages included.
+		logger = zerolog.New(file).Level(zerolog.DebugLevel).With().Timestamp().Logger()
 	}
 	emit("hello", map[string]any{"protocol": protocol})
 
@@ -90,63 +116,98 @@ func run(sessionPath, logPath string) error {
 	if err != nil {
 		return err
 	}
-	paired := auth != nil
-	if !paired {
-		auth = libgm.NewAuthData()
-	}
-	client := libgm.NewClient(auth, nil, logger, exhttp.SensibleClientSettings)
-	save := func() {
-		if err := saveSession(sessionPath, client.AuthData); err != nil {
-			emit("status", map[string]any{"message": "cannot save the session: " + err.Error()})
-		}
-	}
-	client.SetEventHandler(func(evt any) {
-		switch evt := evt.(type) {
-		case *events.PairSuccessful:
-			save()
-			emit("paired", nil)
-		case *events.AuthTokenRefreshed:
-			save()
-		case *events.ClientReady:
-			emit("ready", map[string]any{"conversations": conversations(evt.Conversations)})
-		case *events.PhoneNotResponding:
-			emit("status", map[string]any{"message": "The phone is not responding"})
-		case *events.PhoneRespondingAgain:
-			emit("status", map[string]any{"message": "The phone is back"})
-		case *events.ListenFatalError:
-			emit("fatal", map[string]any{"message": evt.Error.Error()})
-			os.Exit(1)
-		case *events.GaiaLoggedOut, *gmproto.RevokePairData:
-			_ = os.Remove(sessionPath)
-			emit("fatal", map[string]any{"message": "unpaired from the phone: run again to pair"})
-			os.Exit(1)
-		}
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(logger.WithContext(context.Background()))
 	defer cancel()
-	if paired {
-		if err := client.Connect(ctx); err != nil {
+	g := &gmd{sessionPath: sessionPath, logger: logger, ctx: ctx}
+	if auth != nil {
+		g.newClient(auth)
+		if err := g.client.Connect(ctx); err != nil {
 			return fmt.Errorf("cannot connect: %w", err)
 		}
 	} else {
-		url, err := client.StartLogin(ctx)
-		if err != nil {
-			return fmt.Errorf("cannot start pairing: %w", err)
-		}
-		emit("qr", map[string]any{"url": url})
+		emit("login", nil)
 	}
-	defer client.Disconnect()
-	return commands(os.Stdin)
+	defer func() {
+		if g.client != nil {
+			g.client.Disconnect()
+			if g.client.IsLoggedIn() {
+				g.save()
+			}
+		}
+	}()
+	return g.commands(os.Stdin)
+}
+
+func (g *gmd) newClient(auth *libgm.AuthData) {
+	if g.client != nil {
+		g.client.Disconnect()
+	}
+	g.client = libgm.NewClient(auth, nil, g.logger, exhttp.SensibleClientSettings)
+	g.client.SetEventHandler(g.handle)
+}
+
+func (g *gmd) save() {
+	if err := saveSession(g.sessionPath, g.client.AuthData); err != nil {
+		emit("status", map[string]any{"message": "cannot save the session: " + err.Error()})
+	}
+}
+
+// handle gets the events of libgm. It is called synchronously: requests go in goroutines.
+func (g *gmd) handle(evt any) {
+	switch evt := evt.(type) {
+	case *events.PairSuccessful:
+		g.save()
+		emit("paired", nil)
+	case *events.AuthTokenRefreshed:
+		g.save()
+	case *gmproto.UserAlertEvent:
+		// The session is active: the phone answers requests now.
+		if evt.GetAlertType() == gmproto.AlertType_BROWSER_ACTIVE && g.ready.CompareAndSwap(false, true) {
+			go g.listConversations()
+		}
+	case *events.HackySetActiveMayFail:
+		// The phone may miss the first request to make this session the active one.
+		go func() {
+			time.Sleep(7 * time.Second)
+			if !g.ready.Load() {
+				if err := g.client.SetActiveSession(g.ctx); err != nil {
+					g.logger.Err(err).Msg("cannot set the session active")
+				}
+			}
+		}()
+	case *events.PhoneNotResponding:
+		emit("status", map[string]any{"message": "The phone is not responding"})
+	case *events.PhoneRespondingAgain:
+		emit("status", map[string]any{"message": "The phone is back"})
+	case *events.ListenFatalError:
+		emit("fatal", map[string]any{"message": evt.Error.Error()})
+		os.Exit(1)
+	case *events.GaiaLoggedOut, *gmproto.RevokePairData:
+		_ = os.Remove(g.sessionPath)
+		emit("fatal", map[string]any{"message": "unpaired from the phone: run again to pair"})
+		os.Exit(1)
+	}
+}
+
+func (g *gmd) listConversations() {
+	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
+		Count:  conversationCount,
+		Folder: gmproto.ListConversationsRequest_INBOX,
+	})
+	if err != nil {
+		g.ready.Store(false)
+		emit("status", map[string]any{"message": "cannot list the conversations: " + err.Error()})
+		return
+	}
+	emit("ready", map[string]any{"conversations": conversations(resp.GetConversations())})
 }
 
 // commands handles the commands from gmessages-tui until "quit" or the end of stdin.
-func commands(in io.Reader) error {
+func (g *gmd) commands(in io.Reader) error {
 	lines := bufio.NewScanner(in)
+	lines.Buffer(make([]byte, 64*1024), 1024*1024)
 	for lines.Scan() {
-		var cmd struct {
-			Cmd string `json:"cmd"`
-		}
+		var cmd Command
 		if err := json.Unmarshal(lines.Bytes(), &cmd); err != nil {
 			emit("status", map[string]any{"message": "bad command: " + err.Error()})
 			continue
@@ -154,11 +215,68 @@ func commands(in io.Reader) error {
 		switch cmd.Cmd {
 		case "quit":
 			return nil
+		case "pair_google", "pair_qr":
+			if !g.pairing.CompareAndSwap(false, true) {
+				emit("status", map[string]any{"message": "already pairing"})
+				continue
+			}
+			auth := libgm.NewAuthData()
+			if cmd.Cmd == "pair_google" {
+				auth.SetCookies(cmd.Cookies)
+			}
+			g.newClient(auth)
+			go g.pair(cmd.Cmd == "pair_google")
 		default:
 			emit("status", map[string]any{"message": "unknown command " + cmd.Cmd})
 		}
 	}
 	return lines.Err()
+}
+
+// pair pairs the client: says "qr" or "emoji", then "paired", or "pair_failed".
+func (g *gmd) pair(google bool) {
+	pair := g.pairQR
+	if google {
+		pair = g.pairGoogle
+	}
+	if err := pair(); err != nil {
+		emit("pair_failed", map[string]any{"message": err.Error()})
+		g.pairing.Store(false)
+	}
+}
+
+func (g *gmd) pairQR() error {
+	url, err := g.client.StartLogin(g.ctx)
+	if err != nil {
+		return fmt.Errorf("cannot start pairing: %w", err)
+	}
+	emit("qr", map[string]any{"url": url})
+	return nil
+}
+
+func (g *gmd) pairGoogle() error {
+	if err := g.client.FetchConfig(g.ctx); err != nil {
+		return fmt.Errorf("the cookies are not accepted (signed out, or expired?): %w", err)
+	}
+	err := g.client.DoGaiaPairing(g.ctx, func(emoji string) {
+		emit("emoji", map[string]any{"emoji": emoji})
+	})
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, libgm.ErrNoDevicesFound):
+		return errors.New("no phone found for this Google account: in Google Messages, Device pairing, is it signed in?")
+	case errors.Is(err, libgm.ErrPairingInitTimeout):
+		return errors.New("the phone does not respond: is it online?")
+	case errors.Is(err, libgm.ErrIncorrectEmoji):
+		return errors.New("wrong emoji tapped on the phone")
+	case errors.Is(err, libgm.ErrPairingCancelled):
+		return errors.New("cancelled on the phone")
+	case errors.Is(err, libgm.ErrPairingTimeout):
+		return errors.New("no emoji tapped on the phone in time")
+	default:
+		return err
+	}
 }
 
 func conversations(convs []*gmproto.Conversation) []Conversation {

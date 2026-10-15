@@ -17,8 +17,12 @@ fn main() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("gmd");
 
     let bytes = match env::var_os("GMD_PATH") {
-        Some(path) => fs::read(&path)
-            .unwrap_or_else(|e| panic!("cannot read GMD_PATH {}: {e}", Path::new(&path).display())),
+        Some(path) => {
+            println!("cargo:rerun-if-changed={}", Path::new(&path).display());
+            fs::read(&path).unwrap_or_else(|e| {
+                panic!("cannot read GMD_PATH {}: {e}", Path::new(&path).display())
+            })
+        }
         None => download(),
     };
     let sha = hex(&Sha256::digest(&bytes));
