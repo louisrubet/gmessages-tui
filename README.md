@@ -32,7 +32,7 @@ gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as
 
 - **State**: `~/.local/share/gmessages-tui/`: the session (`session.json`, readable by you only: it gives access to your messages) and gmd's log.
 - **Offline build**: build gmd yourself (`cd gmd && CGO_ENABLED=0 go build`), then `GMD_PATH=gmd/gmd cargo build`.
-- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the same Go version gives the same hashes.
+- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes (distribution builds of Go may differ).
 
 ## Dev
 
