@@ -5,12 +5,16 @@
 //!
 //! Not affiliated with Google.
 
+mod gmd;
+
 use std::error::Error;
 use std::future::Future;
+use std::path::Path;
 
 use chat_tui::backend::Result;
-use chat_tui::data::{ChatId, Message};
-use chat_tui::{Backend, Capabilities, Downloaded, Draft};
+use chat_tui::data::{ChatId, Discussion, Message};
+use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event};
+use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
 const NAME: &str = "gmessages-tui";
 
@@ -32,11 +36,84 @@ fn main() {
 
 async fn run() -> std::result::Result<(), Box<dyn Error>> {
     let config = chat_tui::Config::new(NAME)?;
-    chat_tui::run(GMessages, Vec::new(), futures::stream::pending(), config).await?;
-    Ok(())
+    let state = config.read_marks.parent().ok_or("no state directory")?;
+    create_private_dir(state)?;
+    let mut gmd = gmd::Gmd::start(&state.join("session.json"), &state.join("gmd.log")).await?;
+
+    // Until the phone sends the conversations: pairing, if needed, in the terminal.
+    let conversations = loop {
+        match gmd.next().await? {
+            Some(gmd::Event::Qr { url }) => {
+                println!("Scan this QR code from Google Messages on your phone (Device pairing):");
+                chat_tui::qr::print_qr(&url);
+            }
+            Some(gmd::Event::Paired) => println!("Paired, loading the conversations\u{2026}"),
+            Some(gmd::Event::Ready { conversations }) => break conversations,
+            Some(gmd::Event::Status { message }) => eprintln!("{message}"),
+            Some(gmd::Event::Fatal { message }) => return Err(message.into()),
+            Some(gmd::Event::Hello { .. }) => {}
+            None => return Err("gmd stopped".into()),
+        }
+    };
+    let discussions = conversations.into_iter().map(discussion).collect();
+
+    let (lines, control) = gmd.split();
+    let result = chat_tui::run(GMessages, discussions, events(lines), config).await;
+    control.stop().await;
+    Ok(result?)
 }
 
-/// Google Messages, for the interface. Not connected yet: no chats, nothing works.
+/// The interface discussion of a conversation, with its latest message for now.
+fn discussion(conversation: gmd::Conversation) -> Discussion {
+    let mut discussion = Discussion::new(conversation.id, conversation.name);
+    discussion.is_group = conversation.group;
+    if let Some(latest) = conversation.latest {
+        let sent_ms = conversation.timestamp_ms.max(0) as u64;
+        let mut message = Message::mine(latest.id, latest.text, None, false);
+        message.sent_ms = sent_ms;
+        if let Some(time) = chrono::DateTime::from_timestamp_millis(sent_ms as i64) {
+            message.timestamp = time.with_timezone(&chrono::Local).naive_local();
+        }
+        message.from_me = latest.from_me;
+        if !latest.from_me {
+            message.author = Some(latest.sender.clone());
+            message.sender_name = latest.sender;
+        }
+        discussion.messages.push(message);
+    }
+    discussion
+}
+
+/// What gmd reports while the interface runs, as interface events.
+fn events(
+    mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+) -> UnboundedReceiver<Event> {
+    let (events, received) = unbounded();
+    tokio::task::spawn_local(async move {
+        while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
+            let event = match event {
+                gmd::Event::Status { message } => Event::Status(message),
+                gmd::Event::Fatal { message } => Event::Status(format!("Disconnected: {message}")),
+                _ => continue,
+            };
+            if events.unbounded_send(event).is_err() {
+                break;
+            }
+        }
+    });
+    received
+}
+
+/// Creates `dir`, readable by the user only: the session in it gives access to the messages.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Google Messages, for the interface. Only lists the conversations so far.
 struct GMessages;
 
 /// The futures will own what they need (a handle to the client): `'static`, as the trait

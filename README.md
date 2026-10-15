@@ -4,9 +4,11 @@ A terminal client for Google Messages (RCS and SMS), paired with your Android ph
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-**Status:** skeleton. The interface runs, the backend is empty: no pairing, no chats yet.
+**Status:** early. Pairs with the phone and lists the conversations; no messages yet.
 
 ## Install
+
+Needs Rust ≥ 1.89, nothing else.
 
 ```sh
 cargo install --locked --git https://github.com/louisrubet/gmessages-tui
@@ -18,8 +20,29 @@ cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 gmessages-tui         # or `cargo run` from a checkout
 ```
 
+First run: scan the QR code from Google Messages on your phone (*Device pairing*). The phone stays the relay: keep it online.
+
 Keys and terminals: see [signal-tui](https://github.com/louisrubet/signal-tui#keys).
+
+## How it works
+
+Google Messages has no public API. The protocol is spoken by [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) (Go, from mautrix-gmessages), wrapped in **gmd** ([gmd/](gmd/)), a small program speaking JSON lines on stdin/stdout.
+
+gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to the cache directory (`~/.cache/gmessages-tui/`) and started. One executable, no Go needed.
+
+- **State**: `~/.local/share/gmessages-tui/`: the session (`session.json`, readable by you only: it gives access to your messages) and gmd's log.
+- **Offline build**: build gmd yourself (`cd gmd && CGO_ENABLED=0 go build`), then `GMD_PATH=gmd/gmd cargo build`.
+- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the same Go version gives the same hashes.
+
+## Dev
+
+```sh
+GMD_PATH=… cargo run         # with a local gmd
+gmd/build.sh gmd-vX.Y.Z      # all targets into gmd/dist/
+git tag gmd-vX.Y.Z && git push origin gmd-vX.Y.Z   # CI builds and publishes them
+gh release download gmd-vX.Y.Z -p release.txt -O gmd/release.txt --clobber   # then commit it
+```
 
 ## License
 
-[AGPL-3.0-only](LICENSE).
+[AGPL-3.0-only](LICENSE), like libgm.
