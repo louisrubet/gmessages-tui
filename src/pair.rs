@@ -47,12 +47,12 @@ pub struct Pairing {
 }
 
 impl Pairing {
-    /// Serves the page, tells where it is, and reads the terminal.
-    pub async fn start() -> io::Result<Self> {
+    /// Serves the page, tells where it is after `intro`, and reads the terminal.
+    pub async fn start(intro: &str) -> io::Result<Self> {
         let (paste, pasted) = unbounded();
         let page = web::Page::serve(paste.clone()).await?;
         say(&format!(
-            "Pair with the Google account of your phone: open\n\n  {}\n\n\
+            "{intro}: open\n\n  {}\n\n\
              Or here: sign in to that account at {}, then in the developer tools (F12),\n\
              Network, reload, right-click the `config` request, Copy as cURL, and paste it here.\n\
              \n(Esc or Ctrl+C to quit; `gmessages-tui --qr` pairs by QR code instead.)",

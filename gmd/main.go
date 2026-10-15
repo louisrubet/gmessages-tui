@@ -122,7 +122,9 @@ func run(sessionPath, logPath string) error {
 	g := &gmd{sessionPath: sessionPath, logger: logger, ctx: ctx}
 	if auth != nil {
 		g.newClient(auth)
-		if err := g.client.Connect(ctx); err != nil {
+		if err := g.client.Connect(ctx); err != nil && g.ended(err) {
+			g.expired(err)
+		} else if err != nil {
 			return fmt.Errorf("cannot connect: %w", err)
 		}
 	} else {
@@ -181,6 +183,10 @@ func (g *gmd) handle(evt any) {
 	case *events.PhoneRespondingAgain:
 		emit("status", map[string]any{"message": "The phone is back"})
 	case *events.ListenFatalError:
+		if g.ended(evt.Error) {
+			go g.expired(evt.Error)
+			return
+		}
 		emit("fatal", map[string]any{"message": evt.Error.Error()})
 		os.Exit(1)
 	case *events.GaiaLoggedOut, *gmproto.RevokePairData:
@@ -188,6 +194,22 @@ func (g *gmd) handle(evt any) {
 		emit("fatal", map[string]any{"message": "unpaired from the phone: run again to pair"})
 		os.Exit(1)
 	}
+}
+
+// ended tells whether err means the Google session of a Google account pairing has ended:
+// signed out, or ended by Google.
+func (g *gmd) ended(err error) bool {
+	return g.client.AuthData.IsGoogleAccount() &&
+		(errors.Is(err, events.ErrInvalidCredentials) || strings.Contains(err.Error(), "401"))
+}
+
+// expired says the Google session has ended: new cookies of the account sign in again,
+// keeping the pairing (see reauth).
+func (g *gmd) expired(err error) {
+	g.logger.Warn().Err(err).Msg("Google session ended")
+	g.client.Disconnect()
+	g.pairing.Store(false)
+	emit("expired", map[string]any{"message": "the Google session has ended (signed out?)"})
 }
 
 func (g *gmd) listConversations() {
@@ -221,17 +243,49 @@ func (g *gmd) commands(in io.Reader) error {
 				emit("status", map[string]any{"message": "already pairing"})
 				continue
 			}
-			auth := libgm.NewAuthData()
-			if cmd.Cmd == "pair_google" {
-				auth.SetCookies(cmd.Cookies)
+			if cmd.Cmd == "pair_google" && g.client != nil && g.client.AuthData.IsGoogleAccount() {
+				go g.reauth(cmd.Cookies)
+				continue
 			}
-			g.newClient(auth)
-			go g.pair(cmd.Cmd == "pair_google")
+			g.fresh(cmd.Cmd == "pair_google", cmd.Cookies)
 		default:
 			emit("status", map[string]any{"message": "unknown command " + cmd.Cmd})
 		}
 	}
 	return lines.Err()
+}
+
+// fresh pairs from scratch, with the cookies of the Google account or by QR code.
+func (g *gmd) fresh(google bool, cookies map[string]string) {
+	auth := libgm.NewAuthData()
+	if google {
+		auth.SetCookies(cookies)
+	}
+	g.newClient(auth)
+	go g.pair(google)
+}
+
+// reauth signs the pairing in again with new cookies, as long as they are of the same
+// account: no emoji to tap. Pairs from scratch otherwise.
+func (g *gmd) reauth(cookies map[string]string) {
+	auth := g.client.AuthData
+	auth.SetCookies(cookies)
+	err := g.client.FetchConfig(g.ctx)
+	if err == nil {
+		if email := g.client.Config.GetDeviceInfo().GetEmail(); email != auth.Mobile.GetSourceID() {
+			err = fmt.Errorf("signed in to %s, paired with %s", email, auth.Mobile.GetSourceID())
+		}
+	}
+	if err == nil {
+		err = g.client.Connect(g.ctx)
+	}
+	if err != nil {
+		g.logger.Warn().Err(err).Msg("cannot sign the pairing in again, pairing from scratch")
+		g.fresh(true, cookies)
+		return
+	}
+	g.save()
+	emit("paired", nil)
 }
 
 // pair pairs the client: says "qr" or "emoji", then "paired", or "pair_failed".

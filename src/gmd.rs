@@ -31,6 +31,10 @@ pub enum Event {
     Emoji {
         emoji: String,
     },
+    /// The Google session has ended: new cookies of the account sign in again.
+    Expired {
+        message: String,
+    },
     /// Pairing failed: try again.
     PairFailed {
         message: String,

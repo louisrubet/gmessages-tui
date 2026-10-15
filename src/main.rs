@@ -81,7 +81,18 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
             Some(gmd::Event::Login) if qr => {
                 gmd.send(serde_json::json!({"cmd": "pair_qr"})).await?;
             }
-            Some(gmd::Event::Login) => pairing = Some(pair::Pairing::start().await?),
+            Some(gmd::Event::Login) => {
+                let intro = "Pair with the Google account of your phone";
+                pairing = Some(pair::Pairing::start(intro).await?);
+            }
+            Some(gmd::Event::Expired { message }) if pairing.is_none() => {
+                let intro = format!("Sign in again: {message}. Same Google account");
+                pairing = Some(pair::Pairing::start(&intro).await?);
+            }
+            Some(gmd::Event::Expired { message }) => {
+                pair::say(&format!("Sign in again: {message}. Paste again."));
+                page.inspect(|page| page.failed(&message));
+            }
             Some(gmd::Event::PairFailed { message }) if qr => {
                 return Err(format!("pairing failed: {message}").into());
             }
@@ -159,6 +170,9 @@ fn events(
         while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
             let event = match event {
                 gmd::Event::Status { message } => Event::Status(message),
+                gmd::Event::Expired { message } => Event::Status(format!(
+                    "Disconnected: {message}. Restart {NAME} to sign in again"
+                )),
                 gmd::Event::Fatal { message } => Event::Status(format!("Disconnected: {message}")),
                 _ => continue,
             };

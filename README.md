@@ -27,6 +27,8 @@ First run pairs with your phone, like *Sign in with Google* on Google Messages f
 3. Paste it into the page (or the terminal), then tap the emoji shown on your phone.
 4. Close the Google window **without signing out** (signing out ends the session).
 
+If Google ends the session anyway, gmessages-tui asks to sign in again: same steps, same account, no emoji this time.
+
 Only the Google cookies the protocol needs are kept, in the session. `gmessages-tui --qr` pairs by QR code instead (*Device pairing › QR code scanner*), if your phone offers it.
 
 The phone stays the relay: keep it online.
