@@ -7,6 +7,7 @@
 
 mod gmd;
 mod pair;
+mod web;
 
 use std::error::Error;
 use std::future::Future;
@@ -50,28 +51,52 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
     create_private_dir(state)?;
     let mut gmd = gmd::Gmd::start(&state.join("session.json"), &state.join("gmd.log")).await?;
 
-    // Until the phone sends the conversations: pairing, if needed, in the terminal.
+    // Until the phone sends the conversations: pairing, if needed, in the terminal or the
+    // pairing page.
+    let mut pairing: Option<pair::Pairing> = None;
     let conversations = loop {
-        match gmd.next().await? {
+        let pasted = async {
+            match pairing.as_mut() {
+                Some(pairing) => pairing.next().await,
+                None => std::future::pending().await,
+            }
+        };
+        let event = tokio::select! {
+            event = gmd.next() => event?,
+            Some(pasted) = pasted => {
+                let pair::Pasted::Cookies(cookies) = pasted else {
+                    return Ok(());
+                };
+                pair::say("Asking the phone\u{2026}");
+                if let Some(pairing) = &pairing {
+                    pairing.page().asking();
+                }
+                let command = serde_json::json!({"cmd": "pair_google", "cookies": cookies});
+                gmd.send(command).await?;
+                continue;
+            }
+        };
+        let page = pairing.as_ref().map(pair::Pairing::page);
+        match event {
             Some(gmd::Event::Login) if qr => {
                 gmd.send(serde_json::json!({"cmd": "pair_qr"})).await?;
             }
+            Some(gmd::Event::Login) => pairing = Some(pair::Pairing::start().await?),
             Some(gmd::Event::PairFailed { message }) if qr => {
                 return Err(format!("pairing failed: {message}").into());
             }
-            Some(event @ (gmd::Event::Login | gmd::Event::PairFailed { .. })) => {
-                if let gmd::Event::PairFailed { message } = event {
-                    println!("Pairing failed: {message}\n");
-                }
-                let Some(cookies) = pair::ask_cookies()? else {
-                    return Ok(());
-                };
-                println!("Asking the phone\u{2026}");
-                let command = serde_json::json!({"cmd": "pair_google", "cookies": cookies});
-                gmd.send(command).await?;
+            Some(gmd::Event::PairFailed { message }) => {
+                pair::say(&format!(
+                    "Pairing failed: {}. Paste again.",
+                    message.trim_end_matches('.')
+                ));
+                page.inspect(|page| page.failed(&message));
             }
             Some(gmd::Event::Emoji { emoji }) => {
-                println!("\nOn your phone, Google Messages asks to confirm: tap   {emoji}\n");
+                pair::say(&format!(
+                    "\nOn your phone, Google Messages asks to confirm: tap   {emoji}\n"
+                ));
+                page.inspect(|page| page.emoji(&emoji));
             }
             Some(gmd::Event::Qr { url }) => {
                 println!(
@@ -80,9 +105,17 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
                 );
                 chat_tui::qr::print_qr(&url);
             }
-            Some(gmd::Event::Paired) => println!("Paired, loading the conversations\u{2026}"),
-            Some(gmd::Event::Ready { conversations }) => break conversations,
-            Some(gmd::Event::Status { message }) => eprintln!("{message}"),
+            Some(gmd::Event::Paired) => {
+                pair::say("Paired, loading the conversations\u{2026}");
+                page.inspect(|page| page.paired());
+            }
+            Some(gmd::Event::Ready { conversations }) => {
+                if let Some(pairing) = pairing.take() {
+                    pairing.finish();
+                }
+                break conversations;
+            }
+            Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
             Some(gmd::Event::Hello { .. }) => {}
             None => return Err("gmd stopped".into()),

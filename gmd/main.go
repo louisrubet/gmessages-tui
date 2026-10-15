@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -274,6 +275,8 @@ func (g *gmd) pairGoogle() error {
 		return errors.New("cancelled on the phone")
 	case errors.Is(err, libgm.ErrPairingTimeout):
 		return errors.New("no emoji tapped on the phone in time")
+	case strings.Contains(err.Error(), "HTTP 401"):
+		return errors.New("Google refused the cookies (signed out?)")
 	default:
 		return err
 	}

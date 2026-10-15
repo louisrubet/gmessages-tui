@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gmessages-tui pairing</title>
+<style>
+  :root { --bg: #fafafa; --fg: #1d1d1f; --muted: #6b6b70; --card: #fff; --line: #e2e2e6; --accent: #1a73e8; --bad: #c5221f; --good: #188038; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --fg: #ececf0; --muted: #9a9aa2; --card: #1f1f23; --line: #33333a; --accent: #8ab4f8; --bad: #f28b82; --good: #81c995; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 640px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 1.4em; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  ol { padding: 0; margin: 0; list-style: none; counter-reset: step; }
+  li { counter-increment: step; background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 16px 16px 56px; margin-bottom: 12px; position: relative; }
+  li::before { content: counter(step); position: absolute; left: 16px; top: 16px; width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: var(--card); font-weight: 600; text-align: center; line-height: 26px; }
+  a.button, button { display: inline-block; background: var(--accent); color: var(--card); border: 0; border-radius: 8px; padding: 8px 16px; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  code, kbd { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: .9em; }
+  textarea { width: 100%; height: 96px; margin: 8px 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--fg); font: 12px ui-monospace, monospace; resize: vertical; }
+  #status { min-height: 1.5em; }
+  .bad { color: var(--bad); }
+  .good { color: var(--good); }
+  #emoji { display: none; text-align: center; background: var(--card); border: 2px solid var(--accent); border-radius: 12px; padding: 24px 16px; margin-bottom: 12px; }
+  #emoji img { width: 120px; height: 120px; }
+  #emoji .text { font-size: 96px; line-height: 1; }
+  #emoji p { margin: 12px 0 0; font-size: 1.1em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pair gmessages-tui with your phone</h1>
+  <p class="sub">Like “Sign in with Google” on Google Messages for web. Served by gmessages-tui on this computer only.</p>
+
+  <div id="emoji">
+    <img alt="">
+    <div class="text"></div>
+    <p>Tap this emoji in Google Messages on your phone.</p>
+  </div>
+
+  <ol id="steps">
+    <li>
+      Sign in to your phone’s Google account. A private window is best: open this link in one.<br><br>
+      <a class="button" href="{SIGN_IN}" target="_blank" rel="noreferrer">Sign in to Google</a>
+    </li>
+    <li>
+      On the page it opens, <code>messages.google.com/web/config</code>: open the developer tools
+      (<kbd>F12</kbd>), <b>Network</b> tab, reload, right-click the <code>config</code> request,
+      <b>Copy › Copy as cURL</b>.
+    </li>
+    <li>
+      Paste it here:
+      <textarea id="curl" placeholder="curl 'https://messages.google.com/web/config' …" spellcheck="false" autocomplete="off"></textarea>
+      <button id="pair">Pair</button>
+      <div id="status"></div>
+    </li>
+    <li>
+      Once paired, close the Google window <b>without signing out</b>: signing out ends the session.
+    </li>
+  </ol>
+</main>
+<script>
+  const base = location.pathname.replace(/\/$/, "");
+  const curl = document.getElementById("curl");
+  const button = document.getElementById("pair");
+  const status = document.getElementById("status");
+  const emoji = document.getElementById("emoji");
+
+  function say(text, kind) {
+    status.textContent = text;
+    status.className = kind || "";
+  }
+
+  async function pair() {
+    const text = curl.value.trim();
+    if (!text) return;
+    button.disabled = true;
+    say("Sending…");
+    try {
+      const response = await fetch(base + "/cookies", { method: "POST", body: text });
+      if (!response.ok) {
+        say(await response.text(), "bad");
+        button.disabled = false;
+      }
+    } catch (e) {
+      say("gmessages-tui does not answer: is it still running?", "bad");
+      button.disabled = false;
+    }
+  }
+
+  button.addEventListener("click", pair);
+  curl.addEventListener("paste", () => setTimeout(pair, 0));
+
+  let shown = "";
+  function show(stage) {
+    const key = JSON.stringify(stage);
+    if (key === shown) return;
+    shown = key;
+    emoji.style.display = stage.stage === "emoji" ? "block" : "none";
+    switch (stage.stage) {
+      case "waiting":
+        break;
+      case "asking":
+        button.disabled = true;
+        say("Asking the phone…");
+        break;
+      case "emoji": {
+        const img = emoji.querySelector("img");
+        const text = emoji.querySelector(".text");
+        // The emoji as text until the phone's drawing of it (Noto) is loaded.
+        img.style.display = "none";
+        text.style.display = "";
+        text.textContent = stage.emoji;
+        img.alt = stage.emoji;
+        img.onload = () => { img.style.display = ""; text.style.display = "none"; };
+        img.src = stage.image;
+        button.disabled = true;
+        say("Waiting for the phone…");
+        emoji.scrollIntoView({ behavior: "smooth" });
+        break;
+      }
+      case "failed":
+        button.disabled = false;
+        say("Pairing failed: " + stage.message.replace(/\.$/, "") + ". Paste the request again.", "bad");
+        break;
+      case "paired":
+        say("Paired. Loading the conversations…", "good");
+        break;
+      case "done":
+        say("Done: gmessages-tui is ready. Close the Google window without signing out, and this one.", "good");
+        clearInterval(timer);
+        break;
+    }
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch(base + "/stage", { cache: "no-store" });
+      show(await response.json());
+    } catch (e) {
+      if (shown.includes('"done"')) return;
+      if (shown.includes('"paired"')) {
+        say("Paired: gmessages-tui is ready. Close the Google window without signing out, and this one.", "good");
+      } else {
+        say("gmessages-tui is not running any more.", "bad");
+      }
+      clearInterval(timer);
+    }
+  }
+  const timer = setInterval(poll, 1000);
+  poll();
+</script>
+</body>
+</html>

@@ -1,12 +1,18 @@
-//! Pairing in the terminal, before the interface: the cookies of a browser signed in to the
-//! Google account of the phone, pasted here.
+//! Pairing, before the interface: the cookies of a browser signed in to the Google account
+//! of the phone, pasted in the terminal or in the pairing page (see [`web`]).
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
+
+use crate::web;
 
 /// The cookies libgm needs (mautrix-gmessages asks the same), the last one optional.
 const COOKIES: [&str; 7] = [
@@ -22,63 +28,144 @@ const OPTIONAL: usize = 1;
 
 pub type Cookies = BTreeMap<String, String>;
 
-const SIGN_IN: &str =
+pub const SIGN_IN: &str =
     "https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config";
 
-/// Explains, then reads the pasted cookies until they are complete. `None` if cancelled.
-pub fn ask_cookies() -> io::Result<Option<Cookies>> {
-    println!(
-        "Pair with the Google account of your phone:\n\
-         \n  1. In a browser, preferably a private window, sign in to that account at\n     \
-         {SIGN_IN}\n  \
-         2. Open the developer tools (F12), Network tab, reload, right-click the `config` request:\n     \
-         Copy > Copy as cURL.\n  \
-         3. Paste it here. Then close the window without signing out: it would end the session.\n\
-         \n(Esc or Ctrl+C to quit; `gmessages-tui --qr` pairs by QR code instead.)"
-    );
-    loop {
-        let Some(text) = read_paste()? else {
-            return Ok(None);
+/// What the user gives, in the terminal or the browser.
+pub enum Pasted {
+    Cookies(Cookies),
+    Quit,
+}
+
+/// A pairing under way: the cookies are pasted in the terminal or in the pairing page, served
+/// on localhost, which also shows the emoji to tap.
+pub struct Pairing {
+    pasted: UnboundedReceiver<Pasted>,
+    page: web::Page,
+    stop: Arc<AtomicBool>,
+    terminal: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Pairing {
+    /// Serves the page, tells where it is, and reads the terminal.
+    pub async fn start() -> io::Result<Self> {
+        let (paste, pasted) = unbounded();
+        let page = web::Page::serve(paste.clone()).await?;
+        say(&format!(
+            "Pair with the Google account of your phone: open\n\n  {}\n\n\
+             Or here: sign in to that account at {}, then in the developer tools (F12),\n\
+             Network, reload, right-click the `config` request, Copy as cURL, and paste it here.\n\
+             \n(Esc or Ctrl+C to quit; `gmessages-tui --qr` pairs by QR code instead.)",
+            link(page.url()),
+            link(SIGN_IN),
+        ));
+        let stop = Arc::new(AtomicBool::new(false));
+        let terminal = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = read_terminal(&stop, &paste) {
+                    say(&format!("Cannot read the terminal: {e}"));
+                }
+            })
         };
-        match parse(&text) {
-            Ok(cookies) => return Ok(Some(cookies)),
-            Err(e) => println!("{e}. Paste again."),
+        Ok(Pairing {
+            pasted,
+            page,
+            stop,
+            terminal: Some(terminal),
+        })
+    }
+
+    /// What is pasted next.
+    pub async fn next(&mut self) -> Option<Pasted> {
+        self.pasted.next().await
+    }
+
+    pub fn page(&self) -> &web::Page {
+        &self.page
+    }
+
+    /// Paired and ready: the terminal goes back to the interface, the page says it is done.
+    pub fn finish(mut self) {
+        self.stop_terminal();
+        self.page.done();
+    }
+
+    fn stop_terminal(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(terminal) = self.terminal.take() {
+            let _ = terminal.join();
         }
     }
 }
 
-/// Reads what is pasted: a bracketed paste, or keys up to a pause after an Enter (terminals
-/// without bracketed paste). `None` on Esc or Ctrl+C.
-fn read_paste() -> io::Result<Option<String>> {
+impl Drop for Pairing {
+    fn drop(&mut self) {
+        self.stop_terminal();
+    }
+}
+
+/// Prints `text` as lines, also right while the terminal is raw (reading pastes).
+pub fn say(text: &str) {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "{}\r\n", text.replace('\n', "\r\n"));
+    let _ = out.flush();
+}
+
+/// `url`, clickable in terminals that know OSC 8 (the others show it as it is).
+fn link(url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\")
+}
+
+/// Reads the pastes until `stop`, the terminal raw meanwhile: a bracketed paste, or keys up
+/// to a pause after an Enter (terminals without bracketed paste).
+fn read_terminal(stop: &AtomicBool, paste: &UnboundedSender<Pasted>) -> io::Result<()> {
     terminal::enable_raw_mode()?;
     let _ = execute!(io::stdout(), event::EnableBracketedPaste);
     let result = (|| {
         let mut text = String::new();
-        loop {
-            match event::read()? {
-                Event::Paste(paste) => return Ok(Some(paste)),
+        let tick = Duration::from_millis(100);
+        while !stop.load(Ordering::Relaxed) {
+            if !event::poll(tick)? {
+                continue;
+            }
+            let pasted = match event::read()? {
+                Event::Paste(pasted) => pasted,
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
-                    KeyCode::Esc => return Ok(None),
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(None);
+                    KeyCode::Esc => break,
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
+                    KeyCode::Char(c) => {
+                        text.push(c);
+                        continue;
                     }
-                    KeyCode::Char(c) => text.push(c),
-                    KeyCode::Enter if !text.trim().is_empty() => {
+                    // Pasted lines keep coming; a pause ends the paste.
+                    KeyCode::Enter
+                        if !text.trim().is_empty() && !event::poll(Duration::from_millis(300))? =>
+                    {
+                        std::mem::take(&mut text)
+                    }
+                    KeyCode::Enter => {
                         text.push('\n');
-                        // Pasted lines keep coming; a pause ends the paste.
-                        if !event::poll(Duration::from_millis(300))? {
-                            return Ok(Some(text));
-                        }
+                        continue;
                     }
-                    _ => {}
+                    _ => continue,
                 },
-                _ => {}
+                _ => continue,
+            };
+            match parse(&pasted) {
+                Ok(cookies) => {
+                    let _ = paste.unbounded_send(Pasted::Cookies(cookies));
+                }
+                Err(e) => say(&format!("{e}. Paste again.")),
             }
         }
+        if !stop.load(Ordering::Relaxed) {
+            let _ = paste.unbounded_send(Pasted::Quit);
+        }
+        Ok(())
     })();
     let _ = execute!(io::stdout(), event::DisableBracketedPaste);
     terminal::disable_raw_mode()?;
-    let _ = io::stdout().flush();
     result
 }
 

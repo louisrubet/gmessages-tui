@@ -20,12 +20,12 @@ cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 gmessages-tui         # or `cargo run` from a checkout
 ```
 
-First run pairs with your phone, like *Sign in with Google* on Google Messages for web:
+First run pairs with your phone, like *Sign in with Google* on Google Messages for web. gmessages-tui prints a link to a pairing page, served on this computer only:
 
-1. In a browser (a private window is best), sign in to the phone's Google account at [this link](https://accounts.google.com/AccountChooser?continue=https://messages.google.com/web/config).
+1. Sign in to the phone's Google account from it (a private window is best).
 2. Developer tools (F12) › Network › reload › right-click the `config` request › *Copy as cURL*.
-3. Paste it into gmessages-tui, then tap the emoji it shows on your phone.
-4. Close the browser window **without signing out** (signing out ends the session).
+3. Paste it into the page (or the terminal), then tap the emoji shown on your phone.
+4. Close the Google window **without signing out** (signing out ends the session).
 
 Only the Google cookies the protocol needs are kept, in the session. `gmessages-tui --qr` pairs by QR code instead (*Device pairing › QR code scanner*), if your phone offers it.
 

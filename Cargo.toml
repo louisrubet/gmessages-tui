@@ -15,9 +15,10 @@ chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.0.0" }
 chrono = "0.4"
 crossterm = "0.28"
 futures = "0.3"
+getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.48", features = ["macros", "rt", "time", "process", "io-util"] }
+tokio = { version = "1.48", features = ["macros", "rt", "time", "process", "io-util", "net"] }
 
 [build-dependencies]
 sha2 = "0.10"
