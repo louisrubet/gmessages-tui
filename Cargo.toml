@@ -1,0 +1,13 @@
+[package]
+name = "gmessages-tui"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "A terminal client for Google Messages (RCS/SMS). Not affiliated with Google."
+repository = "https://github.com/louisrubet/gmessages-tui"
+
+[dependencies]
+# The interface, shared with signal-tui.
+chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.0.0" }
+futures = "0.3"
+tokio = { version = "1.48", features = ["macros", "rt", "time"] }
