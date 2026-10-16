@@ -57,6 +57,8 @@ pub enum Event {
     /// The message sent by the `send` command of the same `id`, as the phone echoed it.
     Sent {
         id: u64,
+        #[serde(default)]
+        conversation: String,
         message: Option<Message>,
         error: Option<String>,
     },

@@ -391,14 +391,29 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Sent { id, message, error } => {
-                    if let Some(done) = waiting.sends.borrow_mut().remove(&id) {
-                        let _ = done.send(match (message, error) {
-                            (Some(message), None) => Ok(message),
-                            (_, error) => Err(error.unwrap_or_else(|| "not sent".to_string())),
-                        });
+                gmd::Event::Sent {
+                    id,
+                    conversation,
+                    message,
+                    error,
+                } => {
+                    let done = waiting.sends.borrow_mut().remove(&id);
+                    match (done, message, error) {
+                        (Some(done), Some(message), None) => {
+                            let _ = done.send(Ok(message));
+                            continue;
+                        }
+                        (Some(done), _, error) => {
+                            let _ = done.send(Err(error.unwrap_or_else(|| "not sent".to_string())));
+                            continue;
+                        }
+                        // Sent although given up (Esc): shown and stored all the same.
+                        (None, Some(message), None) => Event::History {
+                            messages: sync.history(&conversation, vec![message]),
+                            chat: conversation,
+                        },
+                        (None, ..) => continue,
                     }
-                    continue;
                 }
                 gmd::Event::History {
                     conversation,
@@ -449,12 +464,19 @@ async fn answer<T>(
     sent: bool,
     timeout: Duration,
 ) -> Result<T> {
+    // Given up (dropped, e.g. Esc while sending) or answered: not waiting any more.
+    struct Forget<'a, T>(&'a Pending<T>, u64);
+    impl<T> Drop for Forget<'_, T> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().remove(&self.1);
+        }
+    }
+    let _forget = Forget(pending, id);
     let answer = if sent {
         tokio::time::timeout(timeout, answer).await
     } else {
         Ok(Err(oneshot::Canceled))
     };
-    pending.borrow_mut().remove(&id);
     match answer {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(error))) => Err(error.into()),

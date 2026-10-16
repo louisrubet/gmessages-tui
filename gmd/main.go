@@ -476,7 +476,7 @@ func (g *gmd) commands(in io.Reader) error {
 				if err != nil {
 					emit("sent", map[string]any{"id": cmd.ID, "error": err.Error()})
 				} else {
-					emit("sent", map[string]any{"id": cmd.ID, "message": msg})
+					emit("sent", map[string]any{"id": cmd.ID, "conversation": cmd.Conversation, "message": msg})
 				}
 			}()
 		case "pair_google", "pair_qr":
