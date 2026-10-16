@@ -289,7 +289,7 @@ fn install() -> io::Result<PathBuf> {
 
 /// `gmessages-tui` in the user's cache directory: `~/.cache` (or `$XDG_CACHE_HOME`),
 /// `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on Windows.
-fn cache_dir() -> io::Result<PathBuf> {
+pub fn cache_dir() -> io::Result<PathBuf> {
     let var = |name| {
         std::env::var_os(name)
             .map(PathBuf::from)

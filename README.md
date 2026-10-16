@@ -20,6 +20,16 @@ cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 
 or, from a checkout, `cargo install --locked --path .`. It installs `gmessages-tui` in `~/.cargo/bin` (make sure it is in your `PATH`). Add `--no-default-features` for a headless build without the sign-in window (manual pairing only).
 
+### Building gmd yourself
+
+The build downloads gmd, already built for Linux, macOS and Windows (x86-64, ARM64). For another platform, or offline, build it with Go (version in [gmd/go.mod](gmd/go.mod)) and point `GMD_PATH` to it:
+
+```sh
+git clone https://github.com/louisrubet/gmessages-tui && cd gmessages-tui
+(cd gmd && CGO_ENABLED=0 go build)
+GMD_PATH=gmd/gmd cargo install --locked --path .
+```
+
 ## Run
 
 ```sh
@@ -32,7 +42,16 @@ First run: sign in to the phone's Google account in the window that opens, then 
 
 `gmessages-tui --manual` pairs from a page in your browser, when the window is unavailable or refused by Google (Firefox private window, Developer tools › Network › `config` › *Copy as cURL*, paste). `gmessages-tui --qr` pairs by QR code, for phones that still offer it.
 
-`gmessages-tui --version` prints the release version.
+`gmessages-tui --version` prints the release version, `gmessages-tui --help` the options.
+
+## Uninstall
+
+```sh
+gmessages-tui --uninstall        # store key in the keyring, ~/.local/share/gmessages-tui, ~/.cache/gmessages-tui
+cargo uninstall gmessages-tui    # the program
+```
+
+`--uninstall` asks for confirmation. Also remove the device from your phone (*Device pairing*).
 
 ## Terminal
 
@@ -87,6 +106,7 @@ The state holds the session (`session.json`: it gives access to your messages th
 - **Files** are created readable by you only (Unix).
 - **Sign-in**: the window is private and saves no browser profile; once paired, the session is all that is kept.
 - **Reset**: `gmessages-tui --reset-login` removes the session, then pairs again. Also remove the old device from your phone: that is what revokes it.
+- **Uninstall**: `gmessages-tui --uninstall` deletes the keyring entry first, then the store and the rest of the state.
 - **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
 ## How it works
@@ -95,7 +115,7 @@ Google Messages has no public API. Its protocol is spoken by libgm (Go, from mau
 
 gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to `~/.cache/gmessages-tui/` and started. One executable, no Go needed.
 
-- **Offline build**: `cd gmd && CGO_ENABLED=0 go build`, then `GMD_PATH=gmd/gmd cargo build`.
+- **Offline or other platform**: see [Building gmd yourself](#building-gmd-yourself).
 - **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes.
 
 ## Dev

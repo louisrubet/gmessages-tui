@@ -1,7 +1,7 @@
 //! gmessages-tui: a terminal client for Google Messages, paired with your Android phone
 //! like Google Messages for web.
 //!
-//!   gmessages-tui [--reset-login] [--manual | --qr] | --version
+//!   gmessages-tui [--reset-login] [--manual | --qr] | --uninstall | --version | --help
 //!
 //! Not affiliated with Google.
 
@@ -51,8 +51,19 @@ fn main() {
             println!("v{}", env!("CARGO_PKG_VERSION"));
             return;
         }
+        Ok(cli::Command::Help) => {
+            println!("{}\n\nUsage: {}", cli::HELP, cli::USAGE);
+            return;
+        }
+        Ok(cli::Command::Uninstall) => {
+            if let Err(e) = uninstall() {
+                eprintln!("{NAME}: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         Err(usage) => {
-            eprintln!("usage: {usage}");
+            eprintln!("usage: {usage}\n(--help for details)");
             std::process::exit(2);
         }
     };
@@ -65,6 +76,39 @@ fn main() {
         eprintln!("{NAME}: {e}");
         std::process::exit(1);
     }
+}
+
+/// Removes what gmessages-tui left on this machine, after confirmation: the store key in the
+/// keyring, the state (session, store, log, marks) and the cached gmd.
+fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
+    let config = chat_tui::Config::new(NAME)?;
+    let state = config.read_marks.parent().ok_or("no state directory")?;
+    let cache = gmd::cache_dir()?;
+    println!("This deletes, for good:");
+    println!("  - the store key in the keyring (service {NAME})");
+    println!("  - {} (session, messages, media)", state.display());
+    println!("  - {} (gmd)", cache.display());
+    print!("Continue? [y/N] ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        println!("Nothing removed.");
+        return Ok(());
+    }
+    // The key first: without it, a store left behind cannot be read.
+    key::forget(&state.join("messages.db"))?;
+    for dir in [state, cache.as_path()] {
+        match std::fs::remove_dir_all(dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(format!("cannot remove {}: {e}", dir.display()).into());
+            }
+            _ => {}
+        }
+    }
+    println!("Removed. Also remove gmessages-tui from your phone (Device pairing),");
+    println!("and the program with `cargo uninstall gmessages-tui`.");
+    Ok(())
 }
 
 /// `qr`: pair by QR code rather than with the Google account, if pairing.

@@ -36,6 +36,18 @@ pub fn store_key(path: &Path) -> Result<String, Box<dyn Error>> {
     ask_passphrase(exists)
 }
 
+/// Deletes the keyring entry of the store at `path`, if any. A keyring out of reach holds
+/// nothing of ours: the store was made with a passphrase.
+pub fn forget(path: &Path) -> Result<(), Box<dyn Error>> {
+    let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &path.to_string_lossy()) else {
+        return Ok(());
+    };
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) | Err(keyring::Error::NoStorageAccess(_)) => Ok(()),
+        Err(e) => Err(format!("cannot delete the store key from the keyring: {e}").into()),
+    }
+}
+
 fn random_key() -> Result<String, Box<dyn Error>> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes)?;
