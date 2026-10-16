@@ -1,12 +1,16 @@
 //! gmessages-tui: a terminal client for Google Messages, paired with your Android phone
 //! like Google Messages for web.
 //!
-//!   gmessages-tui [--qr | --version]
+//!   gmessages-tui [--reset-login] [--manual | --qr] | --version
 //!
 //! Not affiliated with Google.
 
+mod cli;
 mod gmd;
 mod pair;
+mod session;
+#[cfg(any(feature = "wry-signin", test))]
+mod signin;
 mod web;
 
 use std::error::Error;
@@ -21,15 +25,24 @@ use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 const NAME: &str = "gmessages-tui";
 
 fn main() {
-    let qr = match std::env::args().nth(1).as_deref() {
-        None => false,
-        Some("--qr") => true,
-        Some("--version") => {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let (qr, manual, reset_login) = match cli::parse(args.iter().map(String::as_str)) {
+        Ok(cli::Command::Run {
+            qr,
+            manual,
+            reset_login,
+        }) => (qr, manual, reset_login),
+        #[cfg(feature = "wry-signin")]
+        Ok(cli::Command::Signin) => {
+            signin::run_child();
+            return;
+        }
+        Ok(cli::Command::Version) => {
             println!("v{}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        Some(_) => {
-            eprintln!("usage: {NAME} [--qr | --version]");
+        Err(usage) => {
+            eprintln!("usage: {usage}");
             std::process::exit(2);
         }
     };
@@ -38,18 +51,23 @@ fn main() {
         .build()
         .expect("cannot create the Tokio runtime");
     let local = tokio::task::LocalSet::new();
-    if let Err(e) = runtime.block_on(local.run_until(run(qr))) {
+    if let Err(e) = runtime.block_on(local.run_until(run(qr, manual, reset_login))) {
         eprintln!("{NAME}: {e}");
         std::process::exit(1);
     }
 }
 
 /// `qr`: pair by QR code rather than with the Google account, if pairing.
-async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
+async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(), Box<dyn Error>> {
     let config = chat_tui::Config::new(NAME)?;
     let state = config.read_marks.parent().ok_or("no state directory")?;
     create_private_dir(state)?;
-    let mut gmd = gmd::Gmd::start(&state.join("session.json"), &state.join("gmd.log")).await?;
+    let session = state.join("session.json");
+    if reset_login {
+        session::reset(&session).map_err(|error| format!("cannot reset local login: {error}"))?;
+        pair::say("Local login reset. Starting a new pairing.");
+    }
+    let mut gmd = gmd::Gmd::start(&session, &state.join("gmd.log")).await?;
 
     // Until the phone sends the conversations: pairing, if needed, in the terminal or the
     // pairing page.
@@ -62,32 +80,37 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
             }
         };
         let event = tokio::select! {
+            _ = tokio::signal::ctrl_c(), if !manual => return Ok(()),
             event = gmd.next() => event?,
             Some(pasted) = pasted => {
-                let pair::Pasted::Cookies(cookies) = pasted else {
-                    return Ok(());
+                let cookies = match pasted {
+                    pair::Pasted::Cookies(cookies) => cookies,
+                    pair::Pasted::Quit => return Ok(()),
+                    pair::Pasted::Failed(error) => return Err(error.into()),
                 };
                 pair::say("Asking the phone\u{2026}");
-                if let Some(pairing) = &pairing {
-                    pairing.page().asking();
+                if let Some(page) = pairing.as_ref().and_then(pair::Pairing::page) {
+                    page.asking();
                 }
                 let command = serde_json::json!({"cmd": "pair_google", "cookies": cookies});
                 gmd.send(command).await?;
                 continue;
             }
         };
-        let page = pairing.as_ref().map(pair::Pairing::page);
+        let page = pairing.as_ref().and_then(pair::Pairing::page);
         match event {
             Some(gmd::Event::Login) if qr => {
                 gmd.send(serde_json::json!({"cmd": "pair_qr"})).await?;
             }
             Some(gmd::Event::Login) => {
                 let intro = "Pair with the Google account of your phone";
-                pairing = Some(pair::Pairing::start(intro).await?);
+                drop(pairing.take());
+                pairing = Some(pair::Pairing::start(intro, manual).await?);
             }
-            Some(gmd::Event::Expired { message }) if pairing.is_none() => {
+            Some(gmd::Event::Expired { message }) if pairing.is_none() || !manual => {
+                drop(pairing.take());
                 let intro = format!("Sign in again: {message}. Same Google account");
-                pairing = Some(pair::Pairing::start(&intro).await?);
+                pairing = Some(pair::Pairing::start(&intro, manual).await?);
             }
             Some(gmd::Event::Expired { message }) => {
                 pair::say(&format!("Sign in again: {message}. Paste again."));
@@ -95,6 +118,16 @@ async fn run(qr: bool) -> std::result::Result<(), Box<dyn Error>> {
             }
             Some(gmd::Event::PairFailed { message }) if qr => {
                 return Err(format!("pairing failed: {message}").into());
+            }
+            Some(gmd::Event::PairFailed { message }) if !manual => {
+                drop(pairing.take());
+                pairing = Some(
+                    pair::Pairing::start(
+                        &format!("Pairing failed: {message}. Sign in again"),
+                        manual,
+                    )
+                    .await?,
+                );
             }
             Some(gmd::Event::PairFailed { message }) => {
                 pair::say(&format!(

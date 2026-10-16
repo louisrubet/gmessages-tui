@@ -1,5 +1,5 @@
-//! Pairing, before the interface: the cookies of a browser signed in to the Google account
-//! of the phone, pasted in the terminal or in the pairing page (see [`web`]).
+//! Pairing before the interface: native Google sign-in by default, or manual
+//! cookie import in the terminal or the local pairing page (see [`web`]).
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -35,18 +35,62 @@ pub const SIGN_IN: &str =
 pub enum Pasted {
     Cookies(Cookies),
     Quit,
+    Failed(String),
+}
+
+/// Selects native sign-in by default, with an explicit manual/headless fallback.
+pub enum Pairing {
+    Manual(ManualPairing),
+    #[cfg(feature = "wry-signin")]
+    Native(crate::signin::Native),
+}
+
+impl Pairing {
+    pub async fn start(intro: &str, manual: bool) -> io::Result<Self> {
+        #[cfg(feature = "wry-signin")]
+        if !manual {
+            return crate::signin::Native::start(intro).map(Self::Native);
+        }
+        #[cfg(not(feature = "wry-signin"))]
+        let _ = manual;
+        ManualPairing::start(intro).await.map(Self::Manual)
+    }
+
+    pub async fn next(&mut self) -> Option<Pasted> {
+        match self {
+            Self::Manual(pairing) => pairing.next().await,
+            #[cfg(feature = "wry-signin")]
+            Self::Native(pairing) => pairing.next().await,
+        }
+    }
+
+    pub fn page(&self) -> Option<&web::Page> {
+        match self {
+            Self::Manual(pairing) => Some(pairing.page()),
+            #[cfg(feature = "wry-signin")]
+            Self::Native(_) => None,
+        }
+    }
+
+    pub fn finish(self) {
+        match self {
+            Self::Manual(pairing) => pairing.finish(),
+            #[cfg(feature = "wry-signin")]
+            Self::Native(_) => {}
+        }
+    }
 }
 
 /// A pairing under way: the cookies are pasted in the terminal or in the pairing page, served
 /// on localhost, which also shows the emoji to tap.
-pub struct Pairing {
+pub struct ManualPairing {
     pasted: UnboundedReceiver<Pasted>,
     page: web::Page,
     stop: Arc<AtomicBool>,
     terminal: Option<std::thread::JoinHandle<()>>,
 }
 
-impl Pairing {
+impl ManualPairing {
     /// Serves the page, tells where it is after `intro`, and reads the terminal.
     pub async fn start(intro: &str) -> io::Result<Self> {
         let (paste, pasted) = unbounded();
@@ -65,11 +109,12 @@ impl Pairing {
             let stop = stop.clone();
             std::thread::spawn(move || {
                 if let Err(e) = read_terminal(&stop, &paste) {
-                    say(&format!("Cannot read the terminal: {e}"));
+                    let _ = paste
+                        .unbounded_send(Pasted::Failed(format!("Cannot read the terminal: {e}")));
                 }
             })
         };
-        Ok(Pairing {
+        Ok(ManualPairing {
             pasted,
             page,
             stop,
@@ -100,7 +145,7 @@ impl Pairing {
     }
 }
 
-impl Drop for Pairing {
+impl Drop for ManualPairing {
     fn drop(&mut self) {
         self.stop_terminal();
     }
@@ -181,7 +226,7 @@ pub fn parse(text: &str) -> Result<Cookies, String> {
     };
     let missing: Vec<_> = COOKIES[..COOKIES.len() - OPTIONAL]
         .iter()
-        .filter(|name| !all.contains_key(**name))
+        .filter(|name| all.get(**name).is_none_or(|value| value.trim().is_empty()))
         .copied()
         .collect();
     if !missing.is_empty() {
@@ -267,6 +312,12 @@ mod tests {
         check(parse(COOKIE).unwrap());
         let json = r#"{"SID":"s","HSID":"h","SSID":"ss","APISID":"a","SAPISID":"sa","OSID":"o"}"#;
         check(parse(json).unwrap());
+    }
+
+    #[test]
+    fn empty_required_cookie_is_missing() {
+        let error = parse(&COOKIE.replace("OSID=o", "OSID= ")).unwrap_err();
+        assert!(error.contains("OSID"));
     }
 
     #[test]
