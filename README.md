@@ -1,26 +1,26 @@
 # gmessages-tui
 
-A terminal client for Google Messages (RCS and SMS), paired with your Android phone like Google Messages for web. Built on [chat-tui](https://github.com/louisrubet/chat-tui), the interface of [signal-tui](https://github.com/louisrubet/signal-tui).
+Running `gmessages` from your terminal.
+
+A Google Messages client (RCS and SMS) for the terminal, paired with your Android phone like Google Messages for web. Built on [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with [signal-tui](https://github.com/louisrubet/signal-tui).
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-**Status:** early. Pairs with the phone, shows the conversations, their messages and images, kept in an encrypted store; receives them live (desktop notifications, typing) and sends them (text, replies, pasted images).
+- **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
+- **History**: past conversations and their last messages, kept in an encrypted store
+- **Live**: new messages, typing, desktop notifications
+- **Replies, forwards**, reactions shown, fuzzy `:shortcode` emoji picker (fzf style)
+- **Pinned chats**, unread counts
 
 ## Install
 
-Needs Rust ≥ 1.89 and the OpenSSL development package, for the encrypted store
-(Fedora: `sudo dnf install openssl-devel`; Debian/Ubuntu: `libssl-dev`). The default build includes a private Google sign-in window
-using [wry](https://github.com/tauri-apps/wry). On Linux, it needs GTK 3 and
-WebKitGTK 4.1 development packages to build (Fedora:
-`sudo dnf install gtk3-devel webkit2gtk4.1-devel`). A graphical desktop session
-is required only when opening the sign-in window.
-
-For a headless build without the native sign-in dependencies, add
-`--no-default-features` to the installation command; it uses manual pairing.
+Needs Rust ≥ 1.89 and the OpenSSL development package (Fedora: `openssl-devel`, Debian/Ubuntu: `libssl-dev`). On Linux, the sign-in window also needs GTK 3 and WebKitGTK 4.1 (Fedora: `gtk3-devel webkit2gtk4.1-devel`, Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`).
 
 ```sh
 cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 ```
+
+or, from a checkout, `cargo install --locked --path .`. It installs `gmessages-tui` in `~/.cargo/bin` (make sure it is in your `PATH`). Add `--no-default-features` for a headless build without the sign-in window (manual pairing only).
 
 ## Run
 
@@ -28,85 +28,89 @@ cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 gmessages-tui         # or `cargo run` from a checkout
 ```
 
-First run opens a private Google sign-in window, based on
-[`examples/wry_signin.rs`](examples/wry_signin.rs):
+First run: sign in to the phone's Google account in the window that opens, then tap the emoji shown in the terminal on your phone. The phone stays the relay: keep it online.
 
-1. Sign in to the Google account used by Google Messages on your phone.
-2. gmessages-tui automatically reads the authentication cookies, hides the window,
-   and asks the phone to pair. No developer tools, cURL command or manual paste is needed.
-3. Tap the emoji shown in the terminal on your phone.
-4. Once the conversations are ready, the hidden browser process is stopped and
-   the TUI starts. Ctrl+C in the terminal cancels pairing; closing the window
-   before it hides also cancels.
+`gmessages-tui --reset-login` forgets the pairing and starts over. Also remove the old device from your phone (*Device pairing*).
 
-The window runs in a subprocess so its graphical event loop does not block the
-terminal. Only the cookies required by libgm are transferred over a private pipe;
-this path does not print their values, save a browser profile, or export temporary
-credential files. The existing gmd session stores the credentials needed to reconnect.
-SOCS is not required. If a saved session is still valid, no sign-in window opens.
-If the session expires during startup, gmessages-tui opens a new sign-in window.
-Google can reject embedded browsers; successful sign-in on one system does not
-guarantee it on every platform.
+`gmessages-tui --manual` pairs from a page in your browser, when the window is unavailable or refused by Google (Firefox private window, Developer tools › Network › `config` › *Copy as cURL*, paste). `gmessages-tui --qr` pairs by QR code, for phones that still offer it.
 
-### Reset the local login
+`gmessages-tui --version` prints the release version.
 
-```sh
-gmessages-tui --reset-login
-# From a checkout:
-cargo run -- --reset-login
-```
+## Terminal
 
-This removes only the local `session.json` before starting a fresh pairing.
-Preferences, read marks and logs are preserved. It is safe if no session exists;
-other deletion errors stop startup rather than silently reusing the old login.
-Close other running instances first so they cannot write their session back.
-This does not sign you out of Google elsewhere or revoke the old paired device
-on your phone; remove that device in Google Messages if needed.
+Any terminal works. For thumbnails, use one that speaks the [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/) **with Unicode placeholders**:
 
-The option can also be combined with `--manual` or `--qr`, in either order.
+| Terminal | Linux | macOS | Windows |
+|---|:-:|:-:|:-:|
+| [Ghostty](https://ghostty.org) (recommended) | ✓ | ✓ | |
+| [kitty](https://sw.kovidgoyal.net/kitty/) | ✓ | ✓ | |
+| [Rio](https://rioterm.com) | ✓ | ✓ | ✓ |
 
-### Manual and QR fallback
+On Windows, Rio is the only native option; kitty also runs under WSL with WSLg.
 
-Use `gmessages-tui --manual` (or `cargo run -- --manual`) if the native window is
-unavailable or refused by Google. It prints a link to a pairing page, served on
-this computer only:
+Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside tmux…) everything works but graphics are reduced: images show as `[image #1]` and open full size with `o`.
 
-1. Sign in to the phone's Google account from it, in a **Firefox private window**.
-   Chrome may bind its Google cookies to the browser (DBSC), preventing their reuse.
-   Go nowhere else in that window.
-2. Developer tools (F12) › Network › reload › right-click the `config` request › *Copy as cURL*.
-3. Paste it into the page (or the terminal), then tap the emoji shown on your phone.
-4. Close the Google window **without signing out** (signing out ends the session).
+## Keys
 
-A build with `--no-default-features` uses this manual flow by default.
-`gmessages-tui --qr` pairs by QR code instead, for phones that still offer it
-(Google is removing it).
+| Key | Action |
+|---|---|
+| `↑` `↓` | select chat / message (in a chat, `↑` starts selecting) |
+| `Enter` | open chat, new message, send |
+| `r` | reply to the selected message |
+| `f` | forward the selected message |
+| `c` | copy the selected message (OSC 52) |
+| `o` | open the links and images of the selected message |
+| `Ctrl+V` | paste the image in the clipboard |
+| `P` | pin / unpin the selected chat |
+| `p` | parameters (from the chat list) |
+| `Esc` | unselect, back, give up a stuck send |
+| `q` | quit |
 
-The phone stays the relay: keep it online.
+Sending reactions (`e`) and deleting (`Del`) are not implemented yet.
 
-Keys and terminals: see [signal-tui](https://github.com/louisrubet/signal-tui#keys).
+## Good to know
+
+- **History**: at start, the interface opens on the store once connected (or after 10 s, to read offline). Only conversations with new messages are fetched again, their last 30 messages.
+- **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`. Downloaded media are stored.
+- **Formatting**: RCS and SMS have none; `**bold**` and the like are sent as plain text.
+- **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
+- **Device name**: the phone lists this client as *gmessages-tui*.
+- **State**: `~/.local/share/gmessages-tui/`. See [Security](#security).
+- **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
+
+## Security
+
+The state holds the session (`session.json`: it gives access to your messages through the phone), the store and gmd's log.
+
+- **Encrypted at rest**: the store (`messages.db`: conversations, messages, media) uses SQLCipher.
+- **The key** is 32 random bytes generated on the first start, kept in the OS keyring: Secret Service on Linux (GNOME Keyring, KWallet), Keychain on macOS, Credential Manager on Windows, under the service `gmessages-tui`.
+  To see it on Linux: `secret-tool search service gmessages-tui`.
+- **No keyring** (headless Linux, SSH): a passphrase is asked at startup instead, or taken from `GMESSAGES_TUI_PASSPHRASE`.
+- **Files** are created readable by you only (Unix).
+- **Sign-in**: the window is private and saves no browser profile; once paired, the session is all that is kept.
+- **Reset**: `gmessages-tui --reset-login` removes the session, then pairs again. Also remove the old device from your phone: that is what revokes it.
+- **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
 ## How it works
 
-Google Messages has no public API. The protocol is spoken by [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) (Go, from mautrix-gmessages), wrapped in **gmd** ([gmd/](gmd/)), a small program speaking JSON lines on stdin/stdout.
+Google Messages has no public API. Its protocol is spoken by libgm (Go, from mautrix-gmessages), wrapped in **gmd** ([gmd/](gmd/)), a small program speaking JSON lines on stdin/stdout.
 
-gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to the cache directory (`~/.cache/gmessages-tui/`) and started. One executable, no Go needed.
+gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to `~/.cache/gmessages-tui/` and started. One executable, no Go needed.
 
-- **State**: `~/.local/share/gmessages-tui/`, readable by you only: the session (`session.json`: it gives access to your messages), the store and gmd's log.
-- **Store**: `messages.db`, SQLite encrypted with SQLCipher: the conversations, their messages and the media downloaded. Its key is a random secret in the OS keyring (Secret Service, Keychain, Credential Manager), entry `gmessages-tui`. Without a keyring (headless, SSH), a passphrase is asked, or read from `$GMESSAGES_TUI_PASSPHRASE`. At start, the interface opens on what is stored once connected (or after 10 s, to read offline); only the conversations whose last message is not stored are fetched again (their last 30 messages).
-- **Device name**: the phone lists this client as *gmessages-tui* (Device pairing), from the pairing on.
-- **Offline build**: build gmd yourself (`cd gmd && CGO_ENABLED=0 go build`), then `GMD_PATH=gmd/gmd cargo build`.
-- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes (distribution builds of Go may differ).
+- **Offline build**: `cd gmd && CGO_ENABLED=0 go build`, then `GMD_PATH=gmd/gmd cargo build`.
+- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes.
 
 ## Dev
 
 ```sh
-GMD_PATH=… cargo run         # with a local gmd
-gmd/build.sh gmd-vX.Y.Z      # all targets into gmd/dist/
-git tag gmd-vX.Y.Z && git push origin gmd-vX.Y.Z   # CI builds and publishes them
+cargo run --example wry_signin --features wry-signin   # does Google accept the webview?
+GMD_PATH=… cargo run                                   # with a local gmd
+cargo test
+gmd/build.sh gmd-vX.Y.Z                                # all targets into gmd/dist/
+git tag gmd-vX.Y.Z && git push origin gmd-vX.Y.Z       # CI builds and publishes them
 gh release download gmd-vX.Y.Z -p release.txt -O gmd/release.txt --clobber   # then commit it
 ```
 
 ## License
 
-[AGPL-3.0-only](LICENSE), like libgm.
+[AGPL-3.0-only](LICENSE), like [libgm](https://github.com/mautrix/gmessages) it is built on.
