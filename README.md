@@ -4,11 +4,12 @@ A terminal client for Google Messages (RCS and SMS), paired with your Android ph
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-**Status:** early. Pairs with the phone, shows the conversations, their last 30 messages and their images; no sending yet.
+**Status:** early. Pairs with the phone, shows the conversations, their messages and images, kept in an encrypted store; no sending yet.
 
 ## Install
 
-Needs Rust ≥ 1.89. The default build includes a private Google sign-in window
+Needs Rust ≥ 1.89 and the OpenSSL development package, for the encrypted store
+(Fedora: `sudo dnf install openssl-devel`; Debian/Ubuntu: `libssl-dev`). The default build includes a private Google sign-in window
 using [wry](https://github.com/tauri-apps/wry). On Linux, it needs GTK 3 and
 WebKitGTK 4.1 development packages to build (Fedora:
 `sudo dnf install gtk3-devel webkit2gtk4.1-devel`). A graphical desktop session
@@ -91,7 +92,9 @@ Google Messages has no public API. The protocol is spoken by [libgm](https://git
 
 gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to the cache directory (`~/.cache/gmessages-tui/`) and started. One executable, no Go needed.
 
-- **State**: `~/.local/share/gmessages-tui/`: the session (`session.json`, readable by you only: it gives access to your messages) and gmd's log.
+- **State**: `~/.local/share/gmessages-tui/`, readable by you only: the session (`session.json`: it gives access to your messages), the store and gmd's log.
+- **Store**: `messages.db`, SQLite encrypted with SQLCipher: the conversations, their messages and the media downloaded. Its key is a random secret in the OS keyring (Secret Service, Keychain, Credential Manager), entry `gmessages-tui`. Without a keyring (headless, SSH), a passphrase is asked, or read from `$GMESSAGES_TUI_PASSPHRASE`. At start, the interface opens on what is stored once connected; only the conversations whose last message is not stored are fetched again (their last 30 messages).
+- **Device name**: the phone lists this client as *gmessages-tui* (Device pairing), from the pairing on.
 - **Offline build**: build gmd yourself (`cd gmd && CGO_ENABLED=0 go build`), then `GMD_PATH=gmd/gmd cargo build`.
 - **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes (distribution builds of Go may differ).
 

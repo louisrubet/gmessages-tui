@@ -7,14 +7,14 @@ use std::process::Stdio;
 
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -42,6 +42,8 @@ pub enum Event {
         message: String,
     },
     Paired,
+    /// Connected and active: the phone answers now, the conversations follow.
+    Connected,
     Ready {
         conversations: Vec<Conversation>,
     },
@@ -75,8 +77,8 @@ pub struct Conversation {
     pub latest: Option<Latest>,
 }
 
-/// A message of a conversation.
-#[derive(Debug, Deserialize)]
+/// A message of a conversation, as gmd says it and the store keeps it.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
     pub id: String,
     pub timestamp_ms: i64,
@@ -87,9 +89,10 @@ pub struct Message {
     pub text: String,
     /// The id of the message it replies to.
     pub quote: Option<String>,
-    /// Content types of its attachments.
+    /// Its media as the phone describes them (content type in `mime`): given back to gmd
+    /// to download them. They hold their decryption keys: kept in the encrypted store only.
     #[serde(default)]
-    pub media: Vec<String>,
+    pub media: Vec<serde_json::Value>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
     #[serde(default)]
@@ -108,7 +111,7 @@ pub struct Attachment {
 }
 
 /// One person's emoji on a message.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Reaction {
     pub emoji: String,
     pub sender_id: String,

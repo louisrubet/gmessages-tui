@@ -7,14 +7,16 @@
 
 mod cli;
 mod gmd;
+mod key;
 mod pair;
 mod session;
 #[cfg(any(feature = "wry-signin", test))]
 mod signin;
+mod store;
 mod web;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::future::Future;
 use std::path::Path;
@@ -72,16 +74,23 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         session::reset(&session).map_err(|error| format!("cannot reset local login: {error}"))?;
         pair::say("Local login reset. Starting a new pairing.");
     }
+    // The store first: its passphrase may be asked.
+    let store_path = state.join("messages.db");
+    let store = Rc::new(store::Store::open(
+        &store_path,
+        &key::store_key(&store_path)?,
+    )?);
+    let stored = store.conversations()?;
     let mut gmd = gmd::Gmd::start(&session, &state.join("gmd.log")).await?;
     // Paired already: connecting and fetching the conversations take a while.
     if session.exists() {
         pair::say("Syncing\u{2026}");
     }
 
-    // Until the phone sends the conversations: pairing, if needed, in the terminal or the
-    // pairing page.
+    // Until connected (with conversations stored) or until the phone sends the conversations:
+    // pairing, if needed, in the terminal or the pairing page.
     let mut pairing: Option<pair::Pairing> = None;
-    let conversations = loop {
+    let ready = loop {
         let pasted = async {
             match pairing.as_mut() {
                 Some(pairing) => pairing.next().await,
@@ -162,34 +171,119 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 pair::say("Paired.\nSyncing\u{2026}");
                 page.inspect(|page| page.paired());
             }
+            // What is stored is shown at once, the rest follows.
+            Some(gmd::Event::Connected) if !stored.is_empty() => {
+                if let Some(pairing) = pairing.take() {
+                    pairing.finish();
+                }
+                break None;
+            }
             Some(gmd::Event::Ready { conversations }) => {
                 if let Some(pairing) = pairing.take() {
                     pairing.finish();
                 }
-                break conversations;
+                break Some(conversations);
             }
             Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
             Some(
                 gmd::Event::Hello { .. }
+                | gmd::Event::Connected
                 | gmd::Event::History { .. }
                 | gmd::Event::Downloaded { .. },
             ) => {}
             None => return Err("gmd stopped".into()),
         }
     };
-    let discussions = conversations.into_iter().map(discussion).collect();
-
+    let mut discussions: Vec<Discussion> = stored.into_iter().map(stored_discussion).collect();
     let (lines, commands, control) = gmd.split();
+    let mut sync = Sync {
+        store: store.clone(),
+        commands: commands.clone(),
+        known: discussions.iter().map(|d| d.id.clone()).collect(),
+    };
+    if let Some(conversations) = ready {
+        discussions.extend(sync.ready(conversations));
+    }
     let backend = GMessages {
         commands,
+        store,
         downloads: Downloads::default(),
         next_id: Cell::new(0),
     };
-    let events = events(lines, backend.downloads.clone());
+    let events = events(lines, sync, backend.downloads.clone());
     let result = chat_tui::run(backend, discussions, events, config).await;
     control.stop().await;
     Ok(result?)
+}
+
+/// What keeps the store and the phone in step.
+struct Sync {
+    store: Rc<store::Store>,
+    commands: gmd::Commands,
+    /// The conversations the interface has.
+    known: HashSet<ChatId>,
+}
+
+impl Sync {
+    /// The conversations listed by the phone: stored, the messages of those that changed
+    /// fetched. Returns the discussions of those not known yet.
+    fn ready(&mut self, conversations: Vec<gmd::Conversation>) -> Vec<Discussion> {
+        if let Err(e) = self.store.save_conversations(&conversations) {
+            pair::say(&format!("Cannot store the conversations: {e}"));
+        }
+        // Changed: its last message is not stored.
+        let changed: Vec<&str> = conversations
+            .iter()
+            .filter(|c| {
+                c.latest
+                    .as_ref()
+                    .is_some_and(|latest| !self.store.has_message(&latest.id).unwrap_or(false))
+            })
+            .map(|c| c.id.as_str())
+            .collect();
+        if !changed.is_empty() {
+            self.commands
+                .send(serde_json::json!({"cmd": "fetch", "conversations": changed}));
+        }
+        conversations
+            .into_iter()
+            .filter(|c| self.known.insert(c.id.clone()))
+            .map(discussion)
+            .collect()
+    }
+
+    /// Messages of `conversation`: stored, then as the interface shows them.
+    fn history(
+        &self,
+        conversation: &str,
+        messages: Vec<gmd::Message>,
+    ) -> Vec<(Message, Option<MessageId>)> {
+        if let Err(e) = self.store.save_messages(conversation, &messages) {
+            pair::say(&format!("Cannot store the messages: {e}"));
+        }
+        messages.into_iter().map(message).collect()
+    }
+}
+
+/// The interface discussion of a stored conversation.
+fn stored_discussion(conversation: store::Conversation) -> Discussion {
+    let mut discussion = Discussion::new(conversation.id, conversation.name);
+    discussion.is_group = conversation.group;
+    let messages: Vec<_> = conversation.messages.into_iter().map(message).collect();
+    let index: HashMap<MessageId, usize> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, (m, _))| (m.id.clone(), i))
+        .collect();
+    discussion.messages = messages
+        .into_iter()
+        .map(|(mut m, quote)| {
+            m.reply_to = quote.and_then(|id| index.get(&id).copied());
+            m
+        })
+        .collect();
+    discussion
 }
 
 /// The interface discussion of a conversation, with its latest message until its history
@@ -226,7 +320,16 @@ fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
         message.author = Some(m.sender_id);
         message.sender_name = m.sender;
     }
-    message.remote_attachments = m.media;
+    message.remote_attachments = m
+        .media
+        .iter()
+        .map(|medium| {
+            medium["mime"]
+                .as_str()
+                .unwrap_or("application/octet-stream")
+                .to_string()
+        })
+        .collect();
     for reaction in m.reactions {
         message.set_reaction(&reaction.sender_id, reaction.mine, Some(&reaction.emoji));
     }
@@ -254,12 +357,21 @@ fn attachment(a: gmd::Attachment) -> std::result::Result<Attachment, String> {
 /// What gmd reports while the interface runs, as interface events.
 fn events(
     mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    mut sync: Sync,
     downloads: Downloads,
 ) -> UnboundedReceiver<Event> {
     let (events, received) = unbounded();
     tokio::task::spawn_local(async move {
         while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
             let event = match event {
+                gmd::Event::Ready { conversations } => {
+                    for discussion in sync.ready(conversations) {
+                        if events.unbounded_send(Event::Chat(discussion)).is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 gmd::Event::Downloaded {
                     id,
                     attachments,
@@ -277,8 +389,8 @@ fn events(
                     conversation,
                     messages,
                 } => Event::History {
+                    messages: sync.history(&conversation, messages),
                     chat: conversation,
-                    messages: messages.into_iter().map(message).collect(),
                 },
                 gmd::Event::Status { message } => Event::Status(message),
                 gmd::Event::Expired { message } => Event::Status(format!(
@@ -315,6 +427,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// so far.
 struct GMessages {
     commands: gmd::Commands,
+    store: Rc<store::Store>,
     downloads: Downloads,
     next_id: Cell<u64>,
 }
@@ -353,22 +466,39 @@ impl Backend for GMessages {
         async { Err("deletion is not implemented yet".into()) }
     }
 
+    /// From the store if downloaded already; else by gmd, then stored.
     fn download(
         &self,
         _chat: &ChatId,
         message: &Message,
     ) -> impl Future<Output = Result<Downloaded>> + 'static {
+        let (store, commands, downloads) = (
+            self.store.clone(),
+            self.commands.clone(),
+            self.downloads.clone(),
+        );
+        let message_id = message.id.clone();
         let id = self.next_id.get() + 1;
         self.next_id.set(id);
-        let (done, answer) = oneshot::channel();
-        self.downloads.borrow_mut().insert(id, done);
-        let sent = self.commands.send(serde_json::json!({
-            "cmd": "download",
-            "id": id,
-            "message": message.id,
-        }));
-        let downloads = self.downloads.clone();
         async move {
+            if let Some(attachments) = store.attachments(&message_id)? {
+                return Ok((attachments, Vec::new()));
+            }
+            let media = store
+                .message(&message_id)?
+                .map(|m| m.media)
+                .unwrap_or_default();
+            if media.is_empty() {
+                return Err("no media known for this message yet".into());
+            }
+            let (done, answer) = oneshot::channel();
+            downloads.borrow_mut().insert(id, done);
+            let sent = commands.send(serde_json::json!({
+                "cmd": "download",
+                "id": id,
+                "message": message_id,
+                "media": media,
+            }));
             if !sent {
                 downloads.borrow_mut().remove(&id);
                 return Err("gmd has stopped".into());
@@ -376,7 +506,10 @@ impl Backend for GMessages {
             let answer = tokio::time::timeout(DOWNLOAD_TIMEOUT, answer).await;
             downloads.borrow_mut().remove(&id);
             match answer {
-                Ok(Ok(Ok(attachments))) => Ok((attachments, Vec::new())),
+                Ok(Ok(Ok(attachments))) => {
+                    store.save_attachments(&message_id, &attachments)?;
+                    Ok((attachments, Vec::new()))
+                }
                 Ok(Ok(Err(error))) => Err(error.into()),
                 Ok(Err(_)) => Err("gmd has stopped".into()),
                 Err(_) => Err("the download took too long".into()),

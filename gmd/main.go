@@ -26,16 +26,17 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/util"
 	"go.mau.fi/util/exhttp"
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 2
+const protocol = 3
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
 
-// Messages fetched per conversation at start, and conversations fetched at once.
+// Messages fetched per conversation when asked, and conversations fetched at once.
 const (
 	historyCount   = 30
 	historyWorkers = 3
@@ -50,9 +51,41 @@ type Message struct {
 	Sender      string     `json:"sender"`
 	Text        string     `json:"text"`
 	Quote       string     `json:"quote,omitempty"`
-	Media       []string   `json:"media,omitempty"`
+	Media       []Medium   `json:"media,omitempty"`
 	Reactions   []Reaction `json:"reactions,omitempty"`
 	Deleted     bool       `json:"deleted,omitempty"`
+}
+
+// Medium is a medium of a message, as the phone describes it: what downloads it. Kept by
+// gmessages-tui (in its encrypted store) and given back to download it.
+type Medium struct {
+	Mime   string `json:"mime"`
+	Name   string `json:"name,omitempty"`
+	Size   int64  `json:"size,omitempty"`
+	Width  int64  `json:"width,omitempty"`
+	Height int64  `json:"height,omitempty"`
+	// Its part of the message, to ask the phone for it in full.
+	Part     string `json:"part,omitempty"`
+	MediaID  string `json:"media_id,omitempty"`
+	Key      []byte `json:"key,omitempty"`
+	ThumbID  string `json:"thumb_id,omitempty"`
+	ThumbKey []byte `json:"thumb_key,omitempty"`
+	// A small preview, in the message itself.
+	Inline []byte `json:"inline,omitempty"`
+}
+
+func medium(m *gmproto.MediaContent, part string) Medium {
+	mime := m.GetMimeType()
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	return Medium{
+		Mime: mime, Name: m.GetMediaName(), Size: m.GetSize(),
+		Width: m.GetDimensions().GetWidth(), Height: m.GetDimensions().GetHeight(),
+		Part: part, MediaID: m.GetMediaID(), Key: m.GetDecryptionKey(),
+		ThumbID: m.GetThumbnailMediaID(), ThumbKey: m.GetThumbnailDecryptionKey(),
+		Inline: m.GetMediaData(),
+	}
 }
 
 // Reaction is one person's emoji on a message.
@@ -85,10 +118,13 @@ type Command struct {
 	Cmd string `json:"cmd"`
 	// For "pair_google": the cookies of a browser signed in to the Google account.
 	Cookies map[string]string `json:"cookies,omitempty"`
-	// For "download": the request, answered by a "downloaded" event of the same id, and the
-	// message whose media to download.
-	ID      uint64 `json:"id,omitempty"`
-	Message string `json:"message,omitempty"`
+	// For "download": the request, answered by a "downloaded" event of the same id, the
+	// message and its media to download.
+	ID      uint64   `json:"id,omitempty"`
+	Message string   `json:"message,omitempty"`
+	Media   []Medium `json:"media,omitempty"`
+	// For "fetch": the conversations whose last messages to fetch.
+	Conversations []string `json:"conversations,omitempty"`
 }
 
 // Attachment is a downloaded medium.
@@ -143,42 +179,14 @@ type gmd struct {
 	lock sync.Mutex
 	// Our participant ids: in conversations, and of the phone's SIMs.
 	self map[string]bool
-	// The media of the messages shown, by message id, to download them.
-	media map[string][]medium
-}
-
-// medium is a medium of a message, and its part id, to ask the phone for it in full.
-type medium struct {
-	content *gmproto.MediaContent
-	part    string
+	// The conversations listed, for the names of their participants.
+	convs map[string]*gmproto.Conversation
+	// Messages whose media were asked in full, waiting for their update.
+	waiting map[string]chan *gmproto.Message
 }
 
 // fullMediumWait is how long the phone has to send a medium in full, once asked.
 const fullMediumWait = 30 * time.Second
-
-// media is what is known of the media of message.
-func (g *gmd) mediaOf(message string) []medium {
-	g.lock.Lock()
-	defer g.lock.Unlock()
-	return g.media[message]
-}
-
-// keepMedia remembers the media of m, to download them.
-func (g *gmd) keepMedia(m *gmproto.Message) {
-	var media []medium
-	for _, part := range m.GetMessageInfo() {
-		if data, ok := part.GetData().(*gmproto.MessageInfo_MediaContent); ok {
-			media = append(media, medium{data.MediaContent, part.GetActionMessageID()})
-		}
-	}
-	g.lock.Lock()
-	defer g.lock.Unlock()
-	if len(media) == 0 {
-		delete(g.media, m.GetMessageID())
-	} else {
-		g.media[m.GetMessageID()] = media
-	}
-}
 
 func (g *gmd) addSelf(id string) {
 	if id == "" {
@@ -207,6 +215,8 @@ func run(sessionPath, logPath string) error {
 		logger = zerolog.New(file).Level(zerolog.DebugLevel).With().Timestamp().Logger()
 	}
 	emit("hello", map[string]any{"protocol": protocol})
+	// The name of this device on the phone (Device pairing), given when pairing.
+	util.BrowserDetailsMessage.OS = "gmessages-tui"
 
 	auth, err := loadSession(sessionPath)
 	if err != nil {
@@ -216,8 +226,9 @@ func run(sessionPath, logPath string) error {
 	defer cancel()
 	g := &gmd{
 		sessionPath: sessionPath, logger: logger, ctx: ctx,
-		self:  map[string]bool{"1": true},
-		media: map[string][]medium{},
+		self:    map[string]bool{"1": true},
+		convs:   map[string]*gmproto.Conversation{},
+		waiting: map[string]chan *gmproto.Message{},
 	}
 	if auth != nil {
 		g.newClient(auth)
@@ -265,6 +276,7 @@ func (g *gmd) handle(evt any) {
 	case *gmproto.UserAlertEvent:
 		// The session is active: the phone answers requests now.
 		if evt.GetAlertType() == gmproto.AlertType_BROWSER_ACTIVE && g.ready.CompareAndSwap(false, true) {
+			emit("connected", nil)
 			go g.listConversations()
 		}
 	case *events.HackySetActiveMayFail:
@@ -279,8 +291,14 @@ func (g *gmd) handle(evt any) {
 		}()
 	case *libgm.WrappedMessage:
 		// Updated, e.g. once the phone has sent a medium in full.
-		if len(g.mediaOf(evt.GetMessageID())) > 0 {
-			g.keepMedia(evt.Message)
+		g.lock.Lock()
+		waiting := g.waiting[evt.GetMessageID()]
+		g.lock.Unlock()
+		if waiting != nil {
+			select {
+			case waiting <- evt.Message:
+			default:
+			}
 		}
 	case *gmproto.Settings:
 		for _, sim := range evt.GetSIMCards() {
@@ -330,46 +348,50 @@ func (g *gmd) listConversations() {
 		emit("status", map[string]any{"message": "cannot list the conversations: " + err.Error()})
 		return
 	}
-	emit("ready", map[string]any{"conversations": conversations(resp.GetConversations())})
-	go g.histories(resp.GetConversations())
-}
-
-// histories fetches the last messages of each conversation, the most recent ones first, a
-// few at a time: one "history" event each.
-func (g *gmd) histories(convs []*gmproto.Conversation) {
-	for _, c := range convs {
+	g.lock.Lock()
+	for _, c := range resp.GetConversations() {
+		g.convs[c.GetConversationID()] = c
 		for _, p := range c.GetParticipants() {
-			if p.GetIsMe() {
-				g.addSelf(p.GetID().GetParticipantID())
+			if p.GetIsMe() && p.GetID().GetParticipantID() != "" {
+				g.self[p.GetID().GetParticipantID()] = true
 			}
 		}
 	}
-	queue := make(chan *gmproto.Conversation)
+	g.lock.Unlock()
+	emit("ready", map[string]any{"conversations": conversations(resp.GetConversations())})
+}
+
+// fetch fetches the last messages of the conversations ids, in order, a few at a time: one
+// "history" event each.
+func (g *gmd) fetch(ids []string) {
+	queue := make(chan string)
 	var wg sync.WaitGroup
 	for range historyWorkers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for c := range queue {
-				resp, err := g.client.FetchMessages(g.ctx, c.GetConversationID(), historyCount, nil)
+			for id := range queue {
+				resp, err := g.client.FetchMessages(g.ctx, id, historyCount, nil)
 				if err != nil {
-					g.logger.Err(err).Str("conversation", c.GetConversationID()).Msg("cannot fetch the messages")
+					g.logger.Err(err).Str("conversation", id).Msg("cannot fetch the messages")
 					continue
 				}
-				names := participantNames(c)
+				g.lock.Lock()
+				names := participantNames(g.convs[id])
+				g.lock.Unlock()
 				list := make([]Message, 0, len(resp.GetMessages()))
 				for _, m := range resp.GetMessages() {
 					if msg, ok := g.message(m, names); ok {
 						list = append(list, msg)
 					}
 				}
-				emit("history", map[string]any{"conversation": c.GetConversationID(), "messages": list})
+				emit("history", map[string]any{"conversation": id, "messages": list})
 			}
 		}()
 	}
-	for _, c := range convs {
+	for _, id := range ids {
 		select {
-		case queue <- c:
+		case queue <- id:
 		case <-g.ctx.Done():
 		}
 	}
@@ -391,7 +413,9 @@ func (g *gmd) commands(in io.Reader) error {
 		case "quit":
 			return nil
 		case "download":
-			go g.download(cmd.ID, cmd.Message)
+			go g.download(cmd.ID, cmd.Message, cmd.Media)
+		case "fetch":
+			go g.fetch(cmd.Conversations)
 		case "pair_google", "pair_qr":
 			if !g.pairing.CompareAndSwap(false, true) {
 				emit("status", map[string]any{"message": "already pairing"})
@@ -409,69 +433,78 @@ func (g *gmd) commands(in io.Reader) error {
 	return lines.Err()
 }
 
-// download downloads the media of message, and says "downloaded" with them, or the error.
+// download downloads media, of message, and says "downloaded" with them, or the error.
 // Those the phone has sent only as previews are asked in full first.
-func (g *gmd) download(id uint64, message string) {
-	media := g.mediaOf(message)
+func (g *gmd) download(id uint64, message string, media []Medium) {
 	if len(media) == 0 {
-		emit("downloaded", map[string]any{"id": id, "error": "no media known for this message"})
+		emit("downloaded", map[string]any{"id": id, "error": "no media for this message"})
 		return
 	}
 	attachments := make([]Attachment, 0, len(media))
-	for i := range media {
-		m := g.full(message, i)
+	for _, m := range media {
+		m = g.full(message, m)
 		data, err := g.downloadMedium(m)
 		if err != nil {
 			emit("downloaded", map[string]any{"id": id, "error": err.Error()})
 			return
 		}
 		attachments = append(attachments, Attachment{
-			ContentType: m.GetMimeType(),
-			Name:        m.GetMediaName(),
-			Data:        data,
-			Width:       m.GetDimensions().GetWidth(),
-			Height:      m.GetDimensions().GetHeight(),
+			ContentType: m.Mime, Name: m.Name, Data: data, Width: m.Width, Height: m.Height,
 		})
 	}
 	emit("downloaded", map[string]any{"id": id, "attachments": attachments})
 }
 
-// full is the i-th medium of message, in full if the phone sends it in time once asked.
-func (g *gmd) full(message string, i int) *gmproto.MediaContent {
-	m := g.mediaOf(message)[i]
-	if m.content.GetMediaID() != "" || m.part == "" {
-		return m.content
+// full is m, a medium of message, in full if the phone sends it in time once asked.
+func (g *gmd) full(message string, m Medium) Medium {
+	if m.MediaID != "" || m.Part == "" {
+		return m
 	}
-	if _, err := g.client.GetFullSizeImage(g.ctx, message, m.part); err != nil {
+	updates := make(chan *gmproto.Message, 4)
+	g.lock.Lock()
+	g.waiting[message] = updates
+	g.lock.Unlock()
+	defer func() {
+		g.lock.Lock()
+		delete(g.waiting, message)
+		g.lock.Unlock()
+	}()
+	if _, err := g.client.GetFullSizeImage(g.ctx, message, m.Part); err != nil {
 		g.logger.Err(err).Msg("cannot ask the phone for a full medium")
-		return m.content
+		return m
 	}
-	deadline := time.Now().Add(fullMediumWait)
-	for time.Now().Before(deadline) {
-		time.Sleep(500 * time.Millisecond)
-		if media := g.mediaOf(message); i < len(media) && media[i].content.GetMediaID() != "" {
-			return media[i].content
+	timeout := time.After(fullMediumWait)
+	for {
+		select {
+		case update := <-updates:
+			for _, part := range update.GetMessageInfo() {
+				data, ok := part.GetData().(*gmproto.MessageInfo_MediaContent)
+				if ok && part.GetActionMessageID() == m.Part && data.MediaContent.GetMediaID() != "" {
+					return medium(data.MediaContent, m.Part)
+				}
+			}
+		case <-timeout:
+			g.logger.Warn().Msg("the phone has not sent the full medium in time")
+			return m
 		}
 	}
-	g.logger.Warn().Msg("the phone has not sent the full medium in time")
-	return m.content
 }
 
-func (g *gmd) downloadMedium(m *gmproto.MediaContent) ([]byte, error) {
+func (g *gmd) downloadMedium(m Medium) ([]byte, error) {
 	g.logger.Debug().
-		Bool("media_id", m.GetMediaID() != "").
-		Bool("thumbnail_id", m.GetThumbnailMediaID() != "").
-		Int("inline_bytes", len(m.GetMediaData())).
-		Int64("size", m.GetSize()).
+		Bool("media_id", m.MediaID != "").
+		Bool("thumbnail_id", m.ThumbID != "").
+		Int("inline_bytes", len(m.Inline)).
+		Int64("size", m.Size).
 		Msg("downloading a medium")
 	// The best there is: the medium, its preview, the small preview in the message.
-	id, key := m.GetMediaID(), m.GetDecryptionKey()
+	id, key := m.MediaID, m.Key
 	if id == "" {
-		id, key = m.GetThumbnailMediaID(), m.GetThumbnailDecryptionKey()
+		id, key = m.ThumbID, m.ThumbKey
 	}
 	if id == "" {
-		if len(m.GetMediaData()) > 0 {
-			return m.GetMediaData(), nil
+		if len(m.Inline) > 0 {
+			return m.Inline, nil
 		}
 		return nil, errors.New("not downloaded by the phone yet")
 	}
@@ -583,8 +616,7 @@ func participantName(p *gmproto.Participant) string {
 	return p.GetID().GetNumber()
 }
 
-// message converts m, and keeps its media to download them; false for what is not a
-// message (protocol changes, group creation…).
+// message converts m; false for what is not a message (protocol changes, group creation…).
 func (g *gmd) message(m *gmproto.Message, names map[string]string) (Message, bool) {
 	status := m.GetMessageStatus().GetStatus()
 	if strings.Contains(status.String(), "TOMBSTONE") {
@@ -605,7 +637,6 @@ func (g *gmd) message(m *gmproto.Message, names map[string]string) (Message, boo
 	if p := m.GetSenderParticipant(); msg.Sender == "" && p != nil {
 		msg.Sender = participantName(p)
 	}
-	g.keepMedia(m)
 	var text []string
 	if subject := m.GetSubject(); subject != "" {
 		text = append(text, subject)
@@ -617,11 +648,7 @@ func (g *gmd) message(m *gmproto.Message, names map[string]string) (Message, boo
 				text = append(text, content)
 			}
 		case *gmproto.MessageInfo_MediaContent:
-			mime := data.MediaContent.GetMimeType()
-			if mime == "" {
-				mime = "application/octet-stream"
-			}
-			msg.Media = append(msg.Media, mime)
+			msg.Media = append(msg.Media, medium(data.MediaContent, part.GetActionMessageID()))
 		}
 	}
 	msg.Text = strings.Join(text, "\n")
