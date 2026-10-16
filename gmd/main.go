@@ -125,6 +125,12 @@ type Command struct {
 	Media   []Medium `json:"media,omitempty"`
 	// For "fetch": the conversations whose last messages to fetch.
 	Conversations []string `json:"conversations,omitempty"`
+	// For "send" (answered by a "sent" event of the same id): the conversation, the text,
+	// the message it replies to and the attachments.
+	Conversation string       `json:"conversation,omitempty"`
+	Text         string       `json:"text,omitempty"`
+	Reply        string       `json:"reply,omitempty"`
+	Attachments  []Attachment `json:"attachments,omitempty"`
 }
 
 // Attachment is a downloaded medium.
@@ -185,7 +191,17 @@ type gmd struct {
 	convs map[string]*gmproto.Conversation
 	// Messages whose media were asked in full, waiting for their update.
 	waiting map[string]chan *gmproto.Message
+	// The phone's SIMs, by their participant id.
+	sims map[string]*gmproto.SIMCard
+	// Messages sent, by temporary id, waiting for their echo (which gives their id).
+	echoes map[string]chan *gmproto.Message
 }
+
+// echoWait is how long a message sent has to come back from the phone with its id.
+const echoWait = 10 * time.Second
+
+// sendRetries are the waits before sending again after a transient failure.
+var sendRetries = []time.Duration{3 * time.Second, 8 * time.Second}
 
 // fullMediumWait is how long the phone has to send a medium in full, once asked.
 const fullMediumWait = 30 * time.Second
@@ -231,6 +247,8 @@ func run(sessionPath, logPath string) error {
 		self:    map[string]bool{"1": true},
 		convs:   map[string]*gmproto.Conversation{},
 		waiting: map[string]chan *gmproto.Message{},
+		sims:    map[string]*gmproto.SIMCard{},
+		echoes:  map[string]chan *gmproto.Message{},
 	}
 	if auth != nil {
 		g.newClient(auth)
@@ -295,6 +313,12 @@ func (g *gmd) handle(evt any) {
 		// Updated, e.g. once the phone has sent a medium in full.
 		g.lock.Lock()
 		waiting := g.waiting[evt.GetMessageID()]
+		if echo := g.echoes[evt.GetTmpID()]; evt.GetTmpID() != "" && echo != nil {
+			select {
+			case echo <- evt.Message:
+			default:
+			}
+		}
 		g.lock.Unlock()
 		if waiting != nil {
 			select {
@@ -310,7 +334,11 @@ func (g *gmd) handle(evt any) {
 		}
 	case *gmproto.Settings:
 		for _, sim := range evt.GetSIMCards() {
-			g.addSelf(sim.GetSIMParticipant().GetID())
+			id := sim.GetSIMParticipant().GetID()
+			g.addSelf(id)
+			g.lock.Lock()
+			g.sims[id] = sim
+			g.lock.Unlock()
 		}
 	case *events.PhoneNotResponding:
 		emit("status", map[string]any{"message": "The phone is not responding"})
@@ -442,6 +470,15 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.download(cmd.ID, cmd.Message, cmd.Media)
 		case "fetch":
 			go g.fetch(cmd.Conversations)
+		case "send":
+			go func() {
+				msg, err := g.send(cmd)
+				if err != nil {
+					emit("sent", map[string]any{"id": cmd.ID, "error": err.Error()})
+				} else {
+					emit("sent", map[string]any{"id": cmd.ID, "message": msg})
+				}
+			}()
 		case "pair_google", "pair_qr":
 			if !g.pairing.CompareAndSwap(false, true) {
 				emit("status", map[string]any{"message": "already pairing"})
@@ -540,6 +577,106 @@ func (g *gmd) downloadMedium(m Medium) ([]byte, error) {
 	}
 	defer body.Close()
 	return io.ReadAll(body)
+}
+
+// send sends cmd's text and attachments to its conversation, from the SIM the conversation
+// uses, and returns the message as the phone echoes it (with its id).
+func (g *gmd) send(cmd Command) (Message, error) {
+	g.lock.Lock()
+	conv := g.convs[cmd.Conversation]
+	g.lock.Unlock()
+	if conv == nil {
+		// Not listed yet (the interface opens on what is stored before): asked.
+		var err error
+		if conv, err = g.client.GetConversation(g.ctx, cmd.Conversation); err != nil {
+			return Message{}, fmt.Errorf("unknown conversation: %w", err)
+		}
+		g.lock.Lock()
+		g.convs[cmd.Conversation] = conv
+		g.lock.Unlock()
+	}
+	var infos []*gmproto.MessageInfo
+	for _, a := range cmd.Attachments {
+		media, err := g.client.UploadMedia(a.Data, a.Name, a.ContentType)
+		if err != nil {
+			return Message{}, fmt.Errorf("cannot upload %s: %w", a.ContentType, err)
+		}
+		infos = append(infos, &gmproto.MessageInfo{
+			Data: &gmproto.MessageInfo_MediaContent{MediaContent: media},
+		})
+	}
+	if cmd.Text != "" {
+		infos = append(infos, &gmproto.MessageInfo{
+			Data: &gmproto.MessageInfo_MessageContent{
+				MessageContent: &gmproto.MessageContent{Content: cmd.Text},
+			},
+		})
+	}
+	if len(infos) == 0 {
+		return Message{}, errors.New("nothing to send")
+	}
+	outgoing := conv.GetDefaultOutgoingID()
+	g.lock.Lock()
+	sim := g.sims[outgoing]
+	g.lock.Unlock()
+	tmp := util.GenerateTmpID()
+	req := &gmproto.SendMessageRequest{
+		ConversationID: cmd.Conversation,
+		MessagePayload: &gmproto.MessagePayload{
+			TmpID:          tmp,
+			ConversationID: cmd.Conversation,
+			ParticipantID:  outgoing,
+			TmpID2:         tmp,
+			MessageInfo:    infos,
+		},
+		SIMPayload: sim.GetSIMData().GetSIMPayload(),
+		TmpID:      tmp,
+	}
+	if cmd.Reply != "" {
+		req.Reply = &gmproto.ReplyPayload{MessageID: cmd.Reply}
+	}
+
+	echo := make(chan *gmproto.Message, 4)
+	g.lock.Lock()
+	g.echoes[tmp] = echo
+	g.lock.Unlock()
+	defer func() {
+		g.lock.Lock()
+		delete(g.echoes, tmp)
+		g.lock.Unlock()
+	}()
+	resp, err := g.client.SendMessage(g.ctx, req)
+	for attempt := 0; err == nil && transient(resp.GetStatus()) && attempt < len(sendRetries); attempt++ {
+		time.Sleep(sendRetries[attempt])
+		resp, err = g.client.SendMessage(g.ctx, req)
+	}
+	if err != nil {
+		return Message{}, err
+	}
+	if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
+		return Message{}, fmt.Errorf("not sent (%s)", resp.GetStatus())
+	}
+
+	names := participantNames(conv)
+	select {
+	case m := <-echo:
+		if msg, ok := g.message(m, names); ok {
+			return msg, nil
+		}
+	case <-time.After(echoWait):
+		g.logger.Warn().Msg("no echo of the message sent")
+	}
+	// Sent, but its id is not known: the temporary one, until the conversation is fetched.
+	return Message{
+		ID: tmp, TimestampMS: time.Now().UnixMilli(), FromMe: true, SenderID: outgoing,
+		Text: cmd.Text, Quote: cmd.Reply,
+	}, nil
+}
+
+// transient tells whether sending may work if tried again.
+func transient(status gmproto.SendMessageResponse_Status) bool {
+	return status == gmproto.SendMessageResponse_FAILURE_2 ||
+		status == gmproto.SendMessageResponse_FAILURE_3
 }
 
 // fresh pairs from scratch, with the cookies of the Google account or by QR code.

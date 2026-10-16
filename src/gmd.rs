@@ -54,6 +54,12 @@ pub enum Event {
         attachments: Vec<Attachment>,
         error: Option<String>,
     },
+    /// The message sent by the `send` command of the same `id`, as the phone echoed it.
+    Sent {
+        id: u64,
+        message: Option<Message>,
+        error: Option<String>,
+    },
     /// The last messages of a conversation.
     History {
         conversation: String,

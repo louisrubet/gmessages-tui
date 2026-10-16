@@ -200,7 +200,8 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 gmd::Event::Hello { .. }
                 | gmd::Event::Connected
                 | gmd::Event::History { .. }
-                | gmd::Event::Downloaded { .. },
+                | gmd::Event::Downloaded { .. }
+                | gmd::Event::Sent { .. },
             ) => {}
             None => return Err("gmd stopped".into()),
         }
@@ -218,10 +219,10 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
     let backend = GMessages {
         commands,
         store,
-        downloads: Downloads::default(),
+        waiting: Waiting::default(),
         next_id: Cell::new(0),
     };
-    let events = events(lines, sync, backend.downloads.clone());
+    let events = events(lines, sync, backend.waiting.clone());
     let result = chat_tui::run(backend, discussions, events, config).await;
     control.stop().await;
     Ok(result?)
@@ -363,7 +364,7 @@ fn attachment(a: gmd::Attachment) -> std::result::Result<Attachment, String> {
 fn events(
     mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
     mut sync: Sync,
-    downloads: Downloads,
+    waiting: Waiting,
 ) -> UnboundedReceiver<Event> {
     let (events, received) = unbounded();
     tokio::task::spawn_local(async move {
@@ -382,10 +383,19 @@ fn events(
                     attachments,
                     error,
                 } => {
-                    if let Some(done) = downloads.borrow_mut().remove(&id) {
+                    if let Some(done) = waiting.downloads.borrow_mut().remove(&id) {
                         let _ = done.send(match error {
                             Some(error) => Err(error),
                             None => attachments.into_iter().map(attachment).collect(),
+                        });
+                    }
+                    continue;
+                }
+                gmd::Event::Sent { id, message, error } => {
+                    if let Some(done) = waiting.sends.borrow_mut().remove(&id) {
+                        let _ = done.send(match (message, error) {
+                            (Some(message), None) => Ok(message),
+                            (_, error) => Err(error.unwrap_or_else(|| "not sent".to_string())),
                         });
                     }
                     continue;
@@ -421,20 +431,59 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Downloads waiting for gmd's answer, by request id.
-type Downloads =
-    Rc<RefCell<HashMap<u64, oneshot::Sender<std::result::Result<Vec<Attachment>, String>>>>>;
+/// Requests waiting for gmd's answer, by request id.
+type Pending<T> = Rc<RefCell<HashMap<u64, oneshot::Sender<std::result::Result<T, String>>>>>;
+
+/// What waits for gmd: downloads, messages being sent.
+#[derive(Clone, Default)]
+struct Waiting {
+    downloads: Pending<Vec<Attachment>>,
+    sends: Pending<gmd::Message>,
+}
+
+/// Waits for the answer to request `id` of `pending`, sent if `sent`.
+async fn answer<T>(
+    pending: &Pending<T>,
+    id: u64,
+    answer: oneshot::Receiver<std::result::Result<T, String>>,
+    sent: bool,
+    timeout: Duration,
+) -> Result<T> {
+    let answer = if sent {
+        tokio::time::timeout(timeout, answer).await
+    } else {
+        Ok(Err(oneshot::Canceled))
+    };
+    pending.borrow_mut().remove(&id);
+    match answer {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(error))) => Err(error.into()),
+        Ok(Err(_)) => Err("gmd has stopped".into()),
+        Err(_) => Err("no answer from the phone in time".into()),
+    }
+}
 
 /// How long a download may take.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long sending may take (uploading attachments included).
+const SEND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Google Messages, for the interface: shows the conversations and downloads their media
 /// so far.
 struct GMessages {
     commands: gmd::Commands,
     store: Rc<store::Store>,
-    downloads: Downloads,
+    waiting: Waiting,
     next_id: Cell<u64>,
+}
+
+impl GMessages {
+    /// A new request id.
+    fn request(&self) -> u64 {
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        id
+    }
 }
 
 /// The futures will own what they need (a handle to the client): `'static`, as the trait
@@ -445,12 +494,44 @@ impl Backend for GMessages {
         Capabilities::default()
     }
 
-    fn send(
-        &self,
-        _chat: &ChatId,
-        _draft: Draft,
-    ) -> impl Future<Output = Result<Message>> + 'static {
-        async { Err("sending is not implemented yet".into()) }
+    /// Sent by gmd, then stored with its attachments: as the phone echoed it, with its id.
+    fn send(&self, chat: &ChatId, draft: Draft) -> impl Future<Output = Result<Message>> + 'static {
+        use base64::Engine;
+        let id = self.request();
+        let (done, sent) = oneshot::channel();
+        self.waiting.sends.borrow_mut().insert(id, done);
+        let attachments: Vec<_> = draft
+            .attachments
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "content_type": a.content_type,
+                    "name": a.file_name.clone().unwrap_or_default(),
+                    "data": base64::engine::general_purpose::STANDARD.encode(&a.bytes),
+                })
+            })
+            .collect();
+        let command = serde_json::json!({
+            "cmd": "send",
+            "id": id,
+            "conversation": chat,
+            "text": draft.text,
+            "reply": draft.reply_to.as_ref().map(|m| &m.id),
+            "attachments": attachments,
+        });
+        let ok = self.commands.send(command);
+        let (store, sends, chat) = (self.store.clone(), self.waiting.sends.clone(), chat.clone());
+        async move {
+            let sent = answer(&sends, id, sent, ok, SEND_TIMEOUT).await?;
+            store.save_messages(&chat, std::slice::from_ref(&sent))?;
+            if !draft.attachments.is_empty() {
+                store.save_attachments(&sent.id, &draft.attachments)?;
+            }
+            let (mut message, _) = message(sent);
+            message.remote_attachments.clear();
+            message.attachments = draft.attachments;
+            Ok(message)
+        }
     }
 
     fn react(
@@ -480,11 +561,10 @@ impl Backend for GMessages {
         let (store, commands, downloads) = (
             self.store.clone(),
             self.commands.clone(),
-            self.downloads.clone(),
+            self.waiting.downloads.clone(),
         );
         let message_id = message.id.clone();
-        let id = self.next_id.get() + 1;
-        self.next_id.set(id);
+        let id = self.request();
         async move {
             if let Some(attachments) = store.attachments(&message_id)? {
                 return Ok((attachments, Vec::new()));
@@ -496,7 +576,7 @@ impl Backend for GMessages {
             if media.is_empty() {
                 return Err("no media known for this message yet".into());
             }
-            let (done, answer) = oneshot::channel();
+            let (done, answer_rx) = oneshot::channel();
             downloads.borrow_mut().insert(id, done);
             let sent = commands.send(serde_json::json!({
                 "cmd": "download",
@@ -504,21 +584,9 @@ impl Backend for GMessages {
                 "message": message_id,
                 "media": media,
             }));
-            if !sent {
-                downloads.borrow_mut().remove(&id);
-                return Err("gmd has stopped".into());
-            }
-            let answer = tokio::time::timeout(DOWNLOAD_TIMEOUT, answer).await;
-            downloads.borrow_mut().remove(&id);
-            match answer {
-                Ok(Ok(Ok(attachments))) => {
-                    store.save_attachments(&message_id, &attachments)?;
-                    Ok((attachments, Vec::new()))
-                }
-                Ok(Ok(Err(error))) => Err(error.into()),
-                Ok(Err(_)) => Err("gmd has stopped".into()),
-                Err(_) => Err("the download took too long".into()),
-            }
+            let attachments = answer(&downloads, id, answer_rx, sent, DOWNLOAD_TIMEOUT).await?;
+            store.save_attachments(&message_id, &attachments)?;
+            Ok((attachments, Vec::new()))
         }
     }
 }
