@@ -1,7 +1,5 @@
 # gmessages-tui
 
-Running `gmessages` from your terminal.
-
 A Google Messages client (RCS and SMS) for the terminal, paired with your Android phone like Google Messages for web. Built on [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with [signal-tui](https://github.com/louisrubet/signal-tui).
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
