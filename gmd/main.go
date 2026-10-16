@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 3
+const protocol = 4
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100

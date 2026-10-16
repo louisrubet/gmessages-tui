@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 3;
+const PROTOCOL: u32 = 4;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
