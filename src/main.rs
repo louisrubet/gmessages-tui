@@ -31,6 +31,9 @@ use futures::channel::oneshot;
 
 const NAME: &str = "gmessages-tui";
 
+/// How long the interface waits to be connected before showing what is stored anyway.
+const OFFLINE_AFTER: Duration = Duration::from_secs(10);
+
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let (qr, manual, reset_login) = match cli::parse(args.iter().map(String::as_str)) {
@@ -90,7 +93,11 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
     // Until connected (with conversations stored) or until the phone sends the conversations:
     // pairing, if needed, in the terminal or the pairing page.
     let mut pairing: Option<pair::Pairing> = None;
+    // With conversations stored, the interface opens even if not connected by then (offline,
+    // phone or Google not answering): what is stored can be read.
+    let offline_after = tokio::time::Instant::now() + OFFLINE_AFTER;
     let ready = loop {
+        let may_open = !stored.is_empty() && pairing.is_none();
         let pasted = async {
             match pairing.as_mut() {
                 Some(pairing) => pairing.next().await,
@@ -99,6 +106,9 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         };
         let event = tokio::select! {
             _ = tokio::signal::ctrl_c(), if !manual => return Ok(()),
+            _ = tokio::time::sleep_until(offline_after), if may_open => {
+                break None;
+            }
             event = gmd.next() => event?,
             Some(pasted) = pasted => {
                 let cookies = match pasted {

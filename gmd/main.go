@@ -175,6 +175,8 @@ type gmd struct {
 	client  *libgm.Client
 	pairing atomic.Bool
 	ready   atomic.Bool
+	// Retrying to make the session active.
+	retrying atomic.Bool
 
 	lock sync.Mutex
 	// Our participant ids: in conversations, and of the phone's SIMs.
@@ -300,6 +302,12 @@ func (g *gmd) handle(evt any) {
 			default:
 			}
 		}
+	case *events.PingFailed:
+		// Making the session active failed (network, Google): again until it is.
+		if !g.ready.Load() && g.retrying.CompareAndSwap(false, true) {
+			emit("status", map[string]any{"message": "Google Messages is not answering, retrying\u2026"})
+			go g.retryActive()
+		}
 	case *gmproto.Settings:
 		for _, sim := range evt.GetSIMCards() {
 			g.addSelf(sim.GetSIMParticipant().GetID())
@@ -319,6 +327,24 @@ func (g *gmd) handle(evt any) {
 		_ = os.Remove(g.sessionPath)
 		emit("fatal", map[string]any{"message": "unpaired from the phone: run again to pair"})
 		os.Exit(1)
+	}
+}
+
+// retryActive asks again, every few seconds, to make the session active, until it is.
+func (g *gmd) retryActive() {
+	defer g.retrying.Store(false)
+	for !g.ready.Load() {
+		select {
+		case <-time.After(10 * time.Second):
+		case <-g.ctx.Done():
+			return
+		}
+		if g.ready.Load() {
+			return
+		}
+		if err := g.client.SetActiveSession(g.ctx); err != nil {
+			g.logger.Err(err).Msg("cannot set the session active")
+		}
 	}
 }
 
