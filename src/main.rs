@@ -232,16 +232,7 @@ impl Sync {
         if let Err(e) = self.store.save_conversations(&conversations) {
             pair::say(&format!("Cannot store the conversations: {e}"));
         }
-        // Changed: its last message is not stored.
-        let changed: Vec<&str> = conversations
-            .iter()
-            .filter(|c| {
-                c.latest
-                    .as_ref()
-                    .is_some_and(|latest| !self.store.has_message(&latest.id).unwrap_or(false))
-            })
-            .map(|c| c.id.as_str())
-            .collect();
+        let changed = self.store.changed().unwrap_or_default();
         if !changed.is_empty() {
             self.commands
                 .send(serde_json::json!({"cmd": "fetch", "conversations": changed}));
@@ -259,7 +250,11 @@ impl Sync {
         conversation: &str,
         messages: Vec<gmd::Message>,
     ) -> Vec<(Message, Option<MessageId>)> {
-        if let Err(e) = self.store.save_messages(conversation, &messages) {
+        if let Err(e) = self
+            .store
+            .save_messages(conversation, &messages)
+            .and_then(|()| Ok(self.store.fetched(conversation)?))
+        {
             pair::say(&format!("Cannot store the messages: {e}"));
         }
         messages.into_iter().map(message).collect()

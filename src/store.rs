@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::gmd;
 
 /// Version of the schema, in `PRAGMA user_version`.
-const SCHEMA: i64 = 1;
+const SCHEMA: i64 = 2;
 
 /// Messages loaded per conversation at start: the most recent ones.
 const LOADED: i64 = 1000;
@@ -81,6 +81,14 @@ impl Store {
                 );",
             )?;
         }
+        if version < 2 {
+            // The last message as the phone lists it, and as it was when last fetched: the
+            // conversation changed when they differ.
+            self.conn.execute_batch(
+                "ALTER TABLE conversations ADD COLUMN latest TEXT;
+                 ALTER TABLE conversations ADD COLUMN synced TEXT;",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)
     }
 
@@ -117,22 +125,39 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut save = tx.prepare(
-                "INSERT INTO conversations (id, name, is_group, timestamp_ms) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET name = ?2, is_group = ?3, timestamp_ms = ?4",
+                "INSERT INTO conversations (id, name, is_group, timestamp_ms, latest)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (id) DO UPDATE SET name = ?2, is_group = ?3, timestamp_ms = ?4,
+                 latest = ?5",
             )?;
             for c in conversations {
-                save.execute(params![c.id, c.name, c.group, c.timestamp_ms])?;
+                let latest = c.latest.as_ref().map(|l| &l.id);
+                save.execute(params![c.id, c.name, c.group, c.timestamp_ms, latest])?;
             }
         }
         tx.commit()
     }
 
-    /// Whether message `id` is stored.
-    pub fn has_message(&self, id: &str) -> rusqlite::Result<bool> {
+    /// The conversations whose last message changed since they were last fetched (see
+    /// [`Store::fetched`]), most recent first.
+    pub fn changed(&self) -> rusqlite::Result<Vec<String>> {
         self.conn
-            .query_row("SELECT 1 FROM messages WHERE id = ?1", [id], |_| Ok(()))
-            .optional()
-            .map(|found| found.is_some())
+            .prepare(
+                "SELECT id FROM conversations WHERE latest IS NOT NULL
+                 AND synced IS NOT latest ORDER BY timestamp_ms DESC",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect()
+    }
+
+    /// Records that `conversation` was fetched: up to date with its last message.
+    pub fn fetched(&self, conversation: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE conversations SET synced = latest WHERE id = ?1",
+                [conversation],
+            )
+            .map(|_| ())
     }
 
     /// Records messages of `conversation`, replacing those stored already.
@@ -256,6 +281,23 @@ mod tests {
             ]))
             .unwrap();
             store.save_conversations(&conversations).unwrap();
+            let latest = |id: &str, message: &str| -> gmd::Conversation {
+                serde_json::from_value(serde_json::json!({
+                    "id": id, "name": id, "group": false, "timestamp_ms": 0,
+                    "latest": {"id": message, "text": "", "from_me": false, "sender": ""},
+                }))
+                .unwrap()
+            };
+            store
+                .save_conversations(&[latest("x", "1"), latest("y", "1")])
+                .unwrap();
+            assert_eq!(store.changed().unwrap(), ["x", "y"], "never fetched");
+            store.fetched("x").unwrap();
+            assert_eq!(store.changed().unwrap(), ["y"]);
+            store.save_conversations(&[latest("x", "2")]).unwrap();
+            assert_eq!(store.changed().unwrap(), ["x", "y"], "new last message");
+            store.fetched("x").unwrap();
+            store.fetched("y").unwrap();
             store
                 .save_messages("new", &[message("b", 20), message("a", 10)])
                 .unwrap();
@@ -288,14 +330,13 @@ mod tests {
         let store = Store::open(&path, "secret").unwrap();
         let conversations = store.conversations().unwrap();
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["new", "old"], "most recent first");
+        assert_eq!(ids, ["new", "old", "x", "y"], "most recent first");
         let messages = &conversations[0].messages;
         let texts: Vec<_> = messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["edited", "text of b"], "in send order");
         assert_eq!(messages[0].media[0]["mime"], "image/jpeg");
         assert!(messages[0].reactions[0].mine);
-        assert!(store.has_message("b").unwrap());
-        assert!(!store.has_message("c").unwrap());
+        assert_eq!(store.changed().unwrap(), Vec::<String>::new());
         assert_eq!(store.message("b").unwrap().unwrap().sender, "Ann");
 
         drop(store);
