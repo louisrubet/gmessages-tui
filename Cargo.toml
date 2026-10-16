@@ -11,9 +11,10 @@ exclude = ["gmd/*.go", "gmd/go.*", "gmd/dist"]
 
 [dependencies]
 # The interface, shared with signal-tui.
-chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.1.0" }
+chat-tui = { git = "https://github.com/louisrubet/chat-tui", tag = "v1.1.1" }
 chrono = "0.4"
 crossterm = "0.28"
+base64 = "0.22"
 futures = "0.3"
 getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }

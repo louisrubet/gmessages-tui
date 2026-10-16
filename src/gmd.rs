@@ -5,6 +5,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use futures::StreamExt;
+use futures::channel::mpsc::{UnboundedSender, unbounded};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -42,6 +44,13 @@ pub enum Event {
     Paired,
     Ready {
         conversations: Vec<Conversation>,
+    },
+    /// The media of a message, for the `download` command of the same `id`.
+    Downloaded {
+        id: u64,
+        #[serde(default)]
+        attachments: Vec<Attachment>,
+        error: Option<String>,
     },
     /// The last messages of a conversation.
     History {
@@ -85,6 +94,17 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     #[serde(default)]
     pub deleted: bool,
+}
+
+/// A downloaded medium.
+#[derive(Debug, Deserialize)]
+pub struct Attachment {
+    pub content_type: String,
+    pub name: Option<String>,
+    /// In base64.
+    pub data: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// One person's emoji on a message.
@@ -153,13 +173,25 @@ impl Gmd {
         next_event(&mut self.events).await
     }
 
-    /// Splits it: the events to read, the rest to stop it.
-    pub fn split(self) -> (Lines<BufReader<ChildStdout>>, Control) {
+    /// Splits it: the events to read, what sends commands, and what stops it. Commands are
+    /// written by a task of the current [`tokio::task::LocalSet`].
+    pub fn split(self) -> (Lines<BufReader<ChildStdout>>, Commands, Control) {
+        let (commands, mut lines) = unbounded::<String>();
+        let mut stdin = self.stdin;
+        let writer = tokio::task::spawn_local(async move {
+            while let Some(line) = lines.next().await {
+                if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let commands = Commands(commands);
         let control = Control {
             child: self.child,
-            stdin: self.stdin,
+            commands: commands.clone(),
+            writer,
         };
-        (self.events, control)
+        (self.events, commands, control)
     }
 }
 
@@ -173,17 +205,30 @@ pub async fn next_event(events: &mut Lines<BufReader<ChildStdout>>) -> io::Resul
     Ok(None)
 }
 
+/// What sends commands to gmd, once split.
+#[derive(Clone)]
+pub struct Commands(UnboundedSender<String>);
+
+impl Commands {
+    /// Sends `command`; false if gmd is gone.
+    pub fn send(&self, command: serde_json::Value) -> bool {
+        self.0.unbounded_send(format!("{command}\n")).is_ok()
+    }
+}
+
 /// What stops gmd.
 pub struct Control {
     child: Child,
-    stdin: ChildStdin,
+    commands: Commands,
+    writer: tokio::task::JoinHandle<()>,
 }
 
 impl Control {
     /// Asks gmd to quit, and kills it if it does not within a second.
     pub async fn stop(mut self) {
-        let _ = self.stdin.write_all(b"{\"cmd\":\"quit\"}\n").await;
-        let _ = self.stdin.flush().await;
+        self.commands.send(serde_json::json!({"cmd": "quit"}));
+        self.commands.0.close_channel();
+        let _ = (&mut self.writer).await;
         if tokio::time::timeout(std::time::Duration::from_secs(1), self.child.wait())
             .await
             .is_err()

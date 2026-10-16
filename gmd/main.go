@@ -85,6 +85,19 @@ type Command struct {
 	Cmd string `json:"cmd"`
 	// For "pair_google": the cookies of a browser signed in to the Google account.
 	Cookies map[string]string `json:"cookies,omitempty"`
+	// For "download": the request, answered by a "downloaded" event of the same id, and the
+	// message whose media to download.
+	ID      uint64 `json:"id,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// Attachment is a downloaded medium.
+type Attachment struct {
+	ContentType string `json:"content_type"`
+	Name        string `json:"name,omitempty"`
+	Data        []byte `json:"data"`
+	Width       int64  `json:"width,omitempty"`
+	Height      int64  `json:"height,omitempty"`
 }
 
 var (
@@ -126,6 +139,60 @@ type gmd struct {
 	client  *libgm.Client
 	pairing atomic.Bool
 	ready   atomic.Bool
+
+	lock sync.Mutex
+	// Our participant ids: in conversations, and of the phone's SIMs.
+	self map[string]bool
+	// The media of the messages shown, by message id, to download them.
+	media map[string][]medium
+}
+
+// medium is a medium of a message, and its part id, to ask the phone for it in full.
+type medium struct {
+	content *gmproto.MediaContent
+	part    string
+}
+
+// fullMediumWait is how long the phone has to send a medium in full, once asked.
+const fullMediumWait = 30 * time.Second
+
+// media is what is known of the media of message.
+func (g *gmd) mediaOf(message string) []medium {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	return g.media[message]
+}
+
+// keepMedia remembers the media of m, to download them.
+func (g *gmd) keepMedia(m *gmproto.Message) {
+	var media []medium
+	for _, part := range m.GetMessageInfo() {
+		if data, ok := part.GetData().(*gmproto.MessageInfo_MediaContent); ok {
+			media = append(media, medium{data.MediaContent, part.GetActionMessageID()})
+		}
+	}
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	if len(media) == 0 {
+		delete(g.media, m.GetMessageID())
+	} else {
+		g.media[m.GetMessageID()] = media
+	}
+}
+
+func (g *gmd) addSelf(id string) {
+	if id == "" {
+		return
+	}
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	g.self[id] = true
+}
+
+func (g *gmd) isSelf(id string) bool {
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	return g.self[id]
 }
 
 func run(sessionPath, logPath string) error {
@@ -147,7 +214,11 @@ func run(sessionPath, logPath string) error {
 	}
 	ctx, cancel := context.WithCancel(logger.WithContext(context.Background()))
 	defer cancel()
-	g := &gmd{sessionPath: sessionPath, logger: logger, ctx: ctx}
+	g := &gmd{
+		sessionPath: sessionPath, logger: logger, ctx: ctx,
+		self:  map[string]bool{"1": true},
+		media: map[string][]medium{},
+	}
 	if auth != nil {
 		g.newClient(auth)
 		if err := g.client.Connect(ctx); err != nil && g.ended(err) {
@@ -206,6 +277,15 @@ func (g *gmd) handle(evt any) {
 				}
 			}
 		}()
+	case *libgm.WrappedMessage:
+		// Updated, e.g. once the phone has sent a medium in full.
+		if len(g.mediaOf(evt.GetMessageID())) > 0 {
+			g.keepMedia(evt.Message)
+		}
+	case *gmproto.Settings:
+		for _, sim := range evt.GetSIMCards() {
+			g.addSelf(sim.GetSIMParticipant().GetID())
+		}
 	case *events.PhoneNotResponding:
 		emit("status", map[string]any{"message": "The phone is not responding"})
 	case *events.PhoneRespondingAgain:
@@ -257,11 +337,10 @@ func (g *gmd) listConversations() {
 // histories fetches the last messages of each conversation, the most recent ones first, a
 // few at a time: one "history" event each.
 func (g *gmd) histories(convs []*gmproto.Conversation) {
-	self := map[string]bool{"1": true}
 	for _, c := range convs {
 		for _, p := range c.GetParticipants() {
 			if p.GetIsMe() {
-				self[p.GetID().GetParticipantID()] = true
+				g.addSelf(p.GetID().GetParticipantID())
 			}
 		}
 	}
@@ -280,7 +359,7 @@ func (g *gmd) histories(convs []*gmproto.Conversation) {
 				names := participantNames(c)
 				list := make([]Message, 0, len(resp.GetMessages()))
 				for _, m := range resp.GetMessages() {
-					if msg, ok := message(m, names, self); ok {
+					if msg, ok := g.message(m, names); ok {
 						list = append(list, msg)
 					}
 				}
@@ -311,6 +390,8 @@ func (g *gmd) commands(in io.Reader) error {
 		switch cmd.Cmd {
 		case "quit":
 			return nil
+		case "download":
+			go g.download(cmd.ID, cmd.Message)
 		case "pair_google", "pair_qr":
 			if !g.pairing.CompareAndSwap(false, true) {
 				emit("status", map[string]any{"message": "already pairing"})
@@ -326,6 +407,80 @@ func (g *gmd) commands(in io.Reader) error {
 		}
 	}
 	return lines.Err()
+}
+
+// download downloads the media of message, and says "downloaded" with them, or the error.
+// Those the phone has sent only as previews are asked in full first.
+func (g *gmd) download(id uint64, message string) {
+	media := g.mediaOf(message)
+	if len(media) == 0 {
+		emit("downloaded", map[string]any{"id": id, "error": "no media known for this message"})
+		return
+	}
+	attachments := make([]Attachment, 0, len(media))
+	for i := range media {
+		m := g.full(message, i)
+		data, err := g.downloadMedium(m)
+		if err != nil {
+			emit("downloaded", map[string]any{"id": id, "error": err.Error()})
+			return
+		}
+		attachments = append(attachments, Attachment{
+			ContentType: m.GetMimeType(),
+			Name:        m.GetMediaName(),
+			Data:        data,
+			Width:       m.GetDimensions().GetWidth(),
+			Height:      m.GetDimensions().GetHeight(),
+		})
+	}
+	emit("downloaded", map[string]any{"id": id, "attachments": attachments})
+}
+
+// full is the i-th medium of message, in full if the phone sends it in time once asked.
+func (g *gmd) full(message string, i int) *gmproto.MediaContent {
+	m := g.mediaOf(message)[i]
+	if m.content.GetMediaID() != "" || m.part == "" {
+		return m.content
+	}
+	if _, err := g.client.GetFullSizeImage(g.ctx, message, m.part); err != nil {
+		g.logger.Err(err).Msg("cannot ask the phone for a full medium")
+		return m.content
+	}
+	deadline := time.Now().Add(fullMediumWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(500 * time.Millisecond)
+		if media := g.mediaOf(message); i < len(media) && media[i].content.GetMediaID() != "" {
+			return media[i].content
+		}
+	}
+	g.logger.Warn().Msg("the phone has not sent the full medium in time")
+	return m.content
+}
+
+func (g *gmd) downloadMedium(m *gmproto.MediaContent) ([]byte, error) {
+	g.logger.Debug().
+		Bool("media_id", m.GetMediaID() != "").
+		Bool("thumbnail_id", m.GetThumbnailMediaID() != "").
+		Int("inline_bytes", len(m.GetMediaData())).
+		Int64("size", m.GetSize()).
+		Msg("downloading a medium")
+	// The best there is: the medium, its preview, the small preview in the message.
+	id, key := m.GetMediaID(), m.GetDecryptionKey()
+	if id == "" {
+		id, key = m.GetThumbnailMediaID(), m.GetThumbnailDecryptionKey()
+	}
+	if id == "" {
+		if len(m.GetMediaData()) > 0 {
+			return m.GetMediaData(), nil
+		}
+		return nil, errors.New("not downloaded by the phone yet")
+	}
+	body, err := g.client.DownloadMedia(id, key)
+	if err != nil {
+		return nil, err
+	}
+	defer body.Close()
+	return io.ReadAll(body)
 }
 
 // fresh pairs from scratch, with the cookies of the Google account or by QR code.
@@ -428,8 +583,9 @@ func participantName(p *gmproto.Participant) string {
 	return p.GetID().GetNumber()
 }
 
-// message converts m; false for what is not a message (protocol changes, group creation…).
-func message(m *gmproto.Message, names map[string]string, self map[string]bool) (Message, bool) {
+// message converts m, and keeps its media to download them; false for what is not a
+// message (protocol changes, group creation…).
+func (g *gmd) message(m *gmproto.Message, names map[string]string) (Message, bool) {
 	status := m.GetMessageStatus().GetStatus()
 	if strings.Contains(status.String(), "TOMBSTONE") {
 		return Message{}, false
@@ -438,15 +594,18 @@ func message(m *gmproto.Message, names map[string]string, self map[string]bool) 
 	msg := Message{
 		ID:          m.GetMessageID(),
 		TimestampMS: m.GetTimestamp() / 1000,
-		FromMe:      self[sender] || m.GetSenderParticipant().GetIsMe(),
-		SenderID:    sender,
-		Sender:      names[sender],
-		Quote:       m.GetReplyMessage().GetMessageID(),
-		Deleted:     status == gmproto.MessageStatusType_MESSAGE_DELETED,
+		// Sent from the phone (or here): its status says so, whichever SIM sent it.
+		FromMe: strings.HasPrefix(status.String(), "OUTGOING_") || g.isSelf(sender) ||
+			m.GetSenderParticipant().GetIsMe(),
+		SenderID: sender,
+		Sender:   names[sender],
+		Quote:    m.GetReplyMessage().GetMessageID(),
+		Deleted:  status == gmproto.MessageStatusType_MESSAGE_DELETED,
 	}
 	if p := m.GetSenderParticipant(); msg.Sender == "" && p != nil {
 		msg.Sender = participantName(p)
 	}
+	g.keepMedia(m)
 	var text []string
 	if subject := m.GetSubject(); subject != "" {
 		text = append(text, subject)
@@ -473,7 +632,7 @@ func message(m *gmproto.Message, names map[string]string, self map[string]bool) 
 		}
 		for _, id := range r.GetParticipantIDs() {
 			msg.Reactions = append(msg.Reactions, Reaction{
-				Emoji: emoji, SenderID: id, Sender: names[id], Mine: self[id],
+				Emoji: emoji, SenderID: id, Sender: names[id], Mine: g.isSelf(id),
 			})
 		}
 	}

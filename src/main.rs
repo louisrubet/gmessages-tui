@@ -13,14 +13,19 @@ mod session;
 mod signin;
 mod web;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::error::Error;
 use std::future::Future;
 use std::path::Path;
+use std::rc::Rc;
+use std::time::Duration;
 
 use chat_tui::backend::Result;
-use chat_tui::data::{ChatId, Discussion, Message, MessageId};
+use chat_tui::data::{Attachment, ChatId, Discussion, Message, MessageId};
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
+use futures::channel::oneshot;
 
 const NAME: &str = "gmessages-tui";
 
@@ -161,14 +166,24 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             }
             Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
-            Some(gmd::Event::Hello { .. } | gmd::Event::History { .. }) => {}
+            Some(
+                gmd::Event::Hello { .. }
+                | gmd::Event::History { .. }
+                | gmd::Event::Downloaded { .. },
+            ) => {}
             None => return Err("gmd stopped".into()),
         }
     };
     let discussions = conversations.into_iter().map(discussion).collect();
 
-    let (lines, control) = gmd.split();
-    let result = chat_tui::run(GMessages, discussions, events(lines), config).await;
+    let (lines, commands, control) = gmd.split();
+    let backend = GMessages {
+        commands,
+        downloads: Downloads::default(),
+        next_id: Cell::new(0),
+    };
+    let events = events(lines, backend.downloads.clone());
+    let result = chat_tui::run(backend, discussions, events, config).await;
     control.stop().await;
     Ok(result?)
 }
@@ -217,14 +232,43 @@ fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
     (message, m.quote.filter(|id| !id.is_empty()))
 }
 
+/// The interface attachment of a downloaded medium.
+fn attachment(a: gmd::Attachment) -> std::result::Result<Attachment, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&a.data)
+        .map_err(|e| format!("bad medium from gmd: {e}"))?;
+    Ok(Attachment {
+        content_type: a.content_type,
+        file_name: a.name.filter(|name| !name.is_empty()),
+        bytes,
+        width: a.width.filter(|&w| w > 0),
+        height: a.height.filter(|&h| h > 0),
+    })
+}
+
 /// What gmd reports while the interface runs, as interface events.
 fn events(
     mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    downloads: Downloads,
 ) -> UnboundedReceiver<Event> {
     let (events, received) = unbounded();
     tokio::task::spawn_local(async move {
         while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
             let event = match event {
+                gmd::Event::Downloaded {
+                    id,
+                    attachments,
+                    error,
+                } => {
+                    if let Some(done) = downloads.borrow_mut().remove(&id) {
+                        let _ = done.send(match error {
+                            Some(error) => Err(error),
+                            None => attachments.into_iter().map(attachment).collect(),
+                        });
+                    }
+                    continue;
+                }
                 gmd::Event::History {
                     conversation,
                     messages,
@@ -256,8 +300,20 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Google Messages, for the interface. Only lists the conversations so far.
-struct GMessages;
+/// Downloads waiting for gmd's answer, by request id.
+type Downloads =
+    Rc<RefCell<HashMap<u64, oneshot::Sender<std::result::Result<Vec<Attachment>, String>>>>>;
+
+/// How long a download may take.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Google Messages, for the interface: shows the conversations and downloads their media
+/// so far.
+struct GMessages {
+    commands: gmd::Commands,
+    downloads: Downloads,
+    next_id: Cell<u64>,
+}
 
 /// The futures will own what they need (a handle to the client): `'static`, as the trait
 /// wants.
@@ -296,8 +352,31 @@ impl Backend for GMessages {
     fn download(
         &self,
         _chat: &ChatId,
-        _message: &Message,
+        message: &Message,
     ) -> impl Future<Output = Result<Downloaded>> + 'static {
-        async { Err("downloads are not implemented yet".into()) }
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        let (done, answer) = oneshot::channel();
+        self.downloads.borrow_mut().insert(id, done);
+        let sent = self.commands.send(serde_json::json!({
+            "cmd": "download",
+            "id": id,
+            "message": message.id,
+        }));
+        let downloads = self.downloads.clone();
+        async move {
+            if !sent {
+                downloads.borrow_mut().remove(&id);
+                return Err("gmd has stopped".into());
+            }
+            let answer = tokio::time::timeout(DOWNLOAD_TIMEOUT, answer).await;
+            downloads.borrow_mut().remove(&id);
+            match answer {
+                Ok(Ok(Ok(attachments))) => Ok((attachments, Vec::new())),
+                Ok(Ok(Err(error))) => Err(error.into()),
+                Ok(Err(_)) => Err("gmd has stopped".into()),
+                Err(_) => Err("the download took too long".into()),
+            }
+        }
     }
 }
