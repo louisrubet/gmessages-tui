@@ -73,6 +73,10 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         pair::say("Local login reset. Starting a new pairing.");
     }
     let mut gmd = gmd::Gmd::start(&session, &state.join("gmd.log")).await?;
+    // Paired already: connecting and fetching the conversations take a while.
+    if session.exists() {
+        pair::say("Syncing\u{2026}");
+    }
 
     // Until the phone sends the conversations: pairing, if needed, in the terminal or the
     // pairing page.
@@ -155,7 +159,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 chat_tui::qr::print_qr(&url);
             }
             Some(gmd::Event::Paired) => {
-                pair::say("Paired, loading the conversations\u{2026}");
+                pair::say("Paired.\nSyncing\u{2026}");
                 page.inspect(|page| page.paired());
             }
             Some(gmd::Event::Ready { conversations }) => {
