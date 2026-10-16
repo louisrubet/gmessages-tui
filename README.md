@@ -4,7 +4,7 @@ A terminal client for Google Messages (RCS and SMS), paired with your Android ph
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-**Status:** early. Pairs with the phone and lists the conversations; no messages yet.
+**Status:** early. Pairs with the phone, shows the conversations and their last 30 messages; no sending yet.
 
 ## Install
 

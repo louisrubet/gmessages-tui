@@ -35,6 +35,34 @@ const protocol = 2
 // Conversations listed when the session becomes active.
 const conversationCount = 100
 
+// Messages fetched per conversation at start, and conversations fetched at once.
+const (
+	historyCount   = 30
+	historyWorkers = 3
+)
+
+// Message is a message as gmessages-tui shows it.
+type Message struct {
+	ID          string     `json:"id"`
+	TimestampMS int64      `json:"timestamp_ms"`
+	FromMe      bool       `json:"from_me"`
+	SenderID    string     `json:"sender_id"`
+	Sender      string     `json:"sender"`
+	Text        string     `json:"text"`
+	Quote       string     `json:"quote,omitempty"`
+	Media       []string   `json:"media,omitempty"`
+	Reactions   []Reaction `json:"reactions,omitempty"`
+	Deleted     bool       `json:"deleted,omitempty"`
+}
+
+// Reaction is one person's emoji on a message.
+type Reaction struct {
+	Emoji    string `json:"emoji"`
+	SenderID string `json:"sender_id"`
+	Sender   string `json:"sender"`
+	Mine     bool   `json:"mine"`
+}
+
 // Conversation is a chat as gmessages-tui shows it.
 type Conversation struct {
 	ID          string  `json:"id"`
@@ -223,6 +251,51 @@ func (g *gmd) listConversations() {
 		return
 	}
 	emit("ready", map[string]any{"conversations": conversations(resp.GetConversations())})
+	go g.histories(resp.GetConversations())
+}
+
+// histories fetches the last messages of each conversation, the most recent ones first, a
+// few at a time: one "history" event each.
+func (g *gmd) histories(convs []*gmproto.Conversation) {
+	self := map[string]bool{"1": true}
+	for _, c := range convs {
+		for _, p := range c.GetParticipants() {
+			if p.GetIsMe() {
+				self[p.GetID().GetParticipantID()] = true
+			}
+		}
+	}
+	queue := make(chan *gmproto.Conversation)
+	var wg sync.WaitGroup
+	for range historyWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := range queue {
+				resp, err := g.client.FetchMessages(g.ctx, c.GetConversationID(), historyCount, nil)
+				if err != nil {
+					g.logger.Err(err).Str("conversation", c.GetConversationID()).Msg("cannot fetch the messages")
+					continue
+				}
+				names := participantNames(c)
+				list := make([]Message, 0, len(resp.GetMessages()))
+				for _, m := range resp.GetMessages() {
+					if msg, ok := message(m, names, self); ok {
+						list = append(list, msg)
+					}
+				}
+				emit("history", map[string]any{"conversation": c.GetConversationID(), "messages": list})
+			}
+		}()
+	}
+	for _, c := range convs {
+		select {
+		case queue <- c:
+		case <-g.ctx.Done():
+		}
+	}
+	close(queue)
+	wg.Wait()
 }
 
 // commands handles the commands from gmessages-tui until "quit" or the end of stdin.
@@ -334,6 +407,77 @@ func (g *gmd) pairGoogle() error {
 	default:
 		return err
 	}
+}
+
+// participantNames maps the participants of c to their names (their numbers if unnamed).
+func participantNames(c *gmproto.Conversation) map[string]string {
+	names := map[string]string{}
+	for _, p := range c.GetParticipants() {
+		names[p.GetID().GetParticipantID()] = participantName(p)
+	}
+	return names
+}
+
+func participantName(p *gmproto.Participant) string {
+	if name := p.GetFullName(); name != "" {
+		return name
+	}
+	if number := p.GetFormattedNumber(); number != "" {
+		return number
+	}
+	return p.GetID().GetNumber()
+}
+
+// message converts m; false for what is not a message (protocol changes, group creation…).
+func message(m *gmproto.Message, names map[string]string, self map[string]bool) (Message, bool) {
+	status := m.GetMessageStatus().GetStatus()
+	if strings.Contains(status.String(), "TOMBSTONE") {
+		return Message{}, false
+	}
+	sender := m.GetParticipantID()
+	msg := Message{
+		ID:          m.GetMessageID(),
+		TimestampMS: m.GetTimestamp() / 1000,
+		FromMe:      self[sender] || m.GetSenderParticipant().GetIsMe(),
+		SenderID:    sender,
+		Sender:      names[sender],
+		Quote:       m.GetReplyMessage().GetMessageID(),
+		Deleted:     status == gmproto.MessageStatusType_MESSAGE_DELETED,
+	}
+	if p := m.GetSenderParticipant(); msg.Sender == "" && p != nil {
+		msg.Sender = participantName(p)
+	}
+	var text []string
+	if subject := m.GetSubject(); subject != "" {
+		text = append(text, subject)
+	}
+	for _, part := range m.GetMessageInfo() {
+		switch data := part.GetData().(type) {
+		case *gmproto.MessageInfo_MessageContent:
+			if content := data.MessageContent.GetContent(); content != "" {
+				text = append(text, content)
+			}
+		case *gmproto.MessageInfo_MediaContent:
+			mime := data.MediaContent.GetMimeType()
+			if mime == "" {
+				mime = "application/octet-stream"
+			}
+			msg.Media = append(msg.Media, mime)
+		}
+	}
+	msg.Text = strings.Join(text, "\n")
+	for _, r := range m.GetReactions() {
+		emoji := r.GetData().GetUnicode()
+		if emoji == "" {
+			continue
+		}
+		for _, id := range r.GetParticipantIDs() {
+			msg.Reactions = append(msg.Reactions, Reaction{
+				Emoji: emoji, SenderID: id, Sender: names[id], Mine: self[id],
+			})
+		}
+	}
+	return msg, true
 }
 
 func conversations(convs []*gmproto.Conversation) []Conversation {

@@ -18,7 +18,7 @@ use std::future::Future;
 use std::path::Path;
 
 use chat_tui::backend::Result;
-use chat_tui::data::{ChatId, Discussion, Message};
+use chat_tui::data::{ChatId, Discussion, Message, MessageId};
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 
@@ -161,7 +161,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             }
             Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
-            Some(gmd::Event::Hello { .. }) => {}
+            Some(gmd::Event::Hello { .. } | gmd::Event::History { .. }) => {}
             None => return Err("gmd stopped".into()),
         }
     };
@@ -173,7 +173,8 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
     Ok(result?)
 }
 
-/// The interface discussion of a conversation, with its latest message for now.
+/// The interface discussion of a conversation, with its latest message until its history
+/// comes.
 fn discussion(conversation: gmd::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
@@ -194,6 +195,28 @@ fn discussion(conversation: gmd::Conversation) -> Discussion {
     discussion
 }
 
+/// The interface message of `m`, with the id of the one it quotes.
+fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
+    let mut message = Message::mine(m.id, m.text, None, false);
+    message.sent_ms = m.timestamp_ms.max(0) as u64;
+    if let Some(time) = chrono::DateTime::from_timestamp_millis(m.timestamp_ms) {
+        message.timestamp = time.with_timezone(&chrono::Local).naive_local();
+    }
+    message.from_me = m.from_me;
+    if !m.from_me {
+        message.author = Some(m.sender_id);
+        message.sender_name = m.sender;
+    }
+    message.remote_attachments = m.media;
+    for reaction in m.reactions {
+        message.set_reaction(&reaction.sender_id, reaction.mine, Some(&reaction.emoji));
+    }
+    if m.deleted {
+        message.mark_deleted();
+    }
+    (message, m.quote.filter(|id| !id.is_empty()))
+}
+
 /// What gmd reports while the interface runs, as interface events.
 fn events(
     mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
@@ -202,6 +225,13 @@ fn events(
     tokio::task::spawn_local(async move {
         while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
             let event = match event {
+                gmd::Event::History {
+                    conversation,
+                    messages,
+                } => Event::History {
+                    chat: conversation,
+                    messages: messages.into_iter().map(message).collect(),
+                },
                 gmd::Event::Status { message } => Event::Status(message),
                 gmd::Event::Expired { message } => Event::Status(format!(
                     "Disconnected: {message}. Restart {NAME} to sign in again"

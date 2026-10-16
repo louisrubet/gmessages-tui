@@ -43,6 +43,11 @@ pub enum Event {
     Ready {
         conversations: Vec<Conversation>,
     },
+    /// The last messages of a conversation.
+    History {
+        conversation: String,
+        messages: Vec<Message>,
+    },
     Status {
         message: String,
     },
@@ -59,6 +64,35 @@ pub struct Conversation {
     pub group: bool,
     pub timestamp_ms: i64,
     pub latest: Option<Latest>,
+}
+
+/// A message of a conversation.
+#[derive(Debug, Deserialize)]
+pub struct Message {
+    pub id: String,
+    pub timestamp_ms: i64,
+    pub from_me: bool,
+    /// Its author, as identified in the conversation.
+    pub sender_id: String,
+    pub sender: String,
+    pub text: String,
+    /// The id of the message it replies to.
+    pub quote: Option<String>,
+    /// Content types of its attachments.
+    #[serde(default)]
+    pub media: Vec<String>,
+    #[serde(default)]
+    pub reactions: Vec<Reaction>,
+    #[serde(default)]
+    pub deleted: bool,
+}
+
+/// One person's emoji on a message.
+#[derive(Debug, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    pub sender_id: String,
+    pub mine: bool,
 }
 
 /// The last message of a conversation, as the phone summarizes it.
