@@ -201,7 +201,10 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 | gmd::Event::Connected
                 | gmd::Event::History { .. }
                 | gmd::Event::Downloaded { .. }
-                | gmd::Event::Sent { .. },
+                | gmd::Event::Sent { .. }
+                | gmd::Event::Message { .. }
+                | gmd::Event::Conversation { .. }
+                | gmd::Event::Typing { .. },
             ) => {}
             None => return Err("gmd stopped".into()),
         }
@@ -253,6 +256,56 @@ impl Sync {
             .filter(|c| self.known.insert(c.id.clone()))
             .map(discussion)
             .collect()
+    }
+
+    /// A message arriving live: stored, then shown, as new (notified) unless known already or
+    /// old.
+    fn live(&self, conversation: String, m: gmd::Message, old: bool) -> Event {
+        let known = matches!(self.store.message(&m.id), Ok(Some(_)));
+        let stored = self
+            .store
+            .save_messages(&conversation, std::slice::from_ref(&m))
+            .and_then(|()| Ok(self.store.arrived(&conversation, &m.id)?));
+        if let Err(e) = stored {
+            return Event::Status(format!("Cannot store the message: {e}"));
+        }
+        let (message, quote) = message(m);
+        if known || old {
+            Event::History {
+                chat: conversation,
+                messages: vec![(message, quote)],
+            }
+        } else {
+            Event::Message {
+                chat: conversation,
+                message,
+                quote,
+            }
+        }
+    }
+
+    /// A conversation new or changed: stored; the discussion of a new one, with what is
+    /// stored of it.
+    fn conversation(&mut self, conversation: gmd::Conversation) -> Option<Discussion> {
+        if let Err(e) = self
+            .store
+            .save_conversations(std::slice::from_ref(&conversation))
+        {
+            pair::say(&format!("Cannot store the conversation: {e}"));
+        }
+        if !self.known.insert(conversation.id.clone()) {
+            return None;
+        }
+        let messages = self.store.messages(&conversation.id).unwrap_or_default();
+        if messages.is_empty() {
+            return Some(discussion(conversation));
+        }
+        Some(stored_discussion(store::Conversation {
+            id: conversation.id,
+            name: conversation.name,
+            group: conversation.group,
+            messages,
+        }))
     }
 
     /// Messages of `conversation`: stored, then as the interface shows them.
@@ -415,6 +468,28 @@ fn events(
                         (None, ..) => continue,
                     }
                 }
+                gmd::Event::Message {
+                    conversation,
+                    message,
+                    old,
+                } => sync.live(conversation, message, old),
+                gmd::Event::Conversation { conversation } => {
+                    match sync.conversation(conversation) {
+                        Some(discussion) => Event::Chat(discussion),
+                        None => continue,
+                    }
+                }
+                gmd::Event::Typing {
+                    conversation,
+                    author,
+                    name,
+                    started,
+                } => Event::Typing {
+                    chat: conversation,
+                    author,
+                    name,
+                    started,
+                },
                 gmd::Event::History {
                     conversation,
                     messages,

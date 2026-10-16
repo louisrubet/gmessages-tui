@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 4
+const protocol = 5
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -326,6 +326,20 @@ func (g *gmd) handle(evt any) {
 			default:
 			}
 		}
+		g.live(evt)
+	case *gmproto.Conversation:
+		// New, or changed (name, last message…).
+		g.lock.Lock()
+		g.convs[evt.GetConversationID()] = evt
+		for _, p := range evt.GetParticipants() {
+			if p.GetIsMe() && p.GetID().GetParticipantID() != "" {
+				g.self[p.GetID().GetParticipantID()] = true
+			}
+		}
+		g.lock.Unlock()
+		emit("conversation", map[string]any{"conversation": conversations([]*gmproto.Conversation{evt})[0]})
+	case *gmproto.TypingData:
+		g.typing(evt)
 	case *events.PingFailed:
 		// Making the session active failed (network, Google): again until it is.
 		if !g.ready.Load() && g.retrying.CompareAndSwap(false, true) {
@@ -355,6 +369,40 @@ func (g *gmd) handle(evt any) {
 		_ = os.Remove(g.sessionPath)
 		emit("fatal", map[string]any{"message": "unpaired from the phone: run again to pair"})
 		os.Exit(1)
+	}
+}
+
+// live says a message received, sent from the phone, or updated (reactions, status…):
+// "message", `old` if it is not news (synced from before).
+func (g *gmd) live(evt *libgm.WrappedMessage) {
+	g.lock.Lock()
+	names := participantNames(g.convs[evt.GetConversationID()])
+	g.lock.Unlock()
+	if msg, ok := g.message(evt.Message, names); ok {
+		emit("message", map[string]any{
+			"conversation": evt.GetConversationID(),
+			"message":      msg,
+			"old":          evt.IsOld,
+		})
+	}
+}
+
+// typing says someone started or stopped typing: "typing".
+func (g *gmd) typing(evt *gmproto.TypingData) {
+	number := evt.GetUser().GetNumber()
+	g.lock.Lock()
+	defer g.lock.Unlock()
+	for _, p := range g.convs[evt.GetConversationID()].GetParticipants() {
+		if p.GetIsMe() || (p.GetID().GetNumber() != number && p.GetFormattedNumber() != number) {
+			continue
+		}
+		emit("typing", map[string]any{
+			"conversation": evt.GetConversationID(),
+			"author":       p.GetID().GetParticipantID(),
+			"name":         participantName(p),
+			"started":      evt.GetType() == gmproto.TypingTypes_STARTED_TYPING,
+		})
+		return
 	}
 }
 

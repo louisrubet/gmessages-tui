@@ -181,6 +181,34 @@ impl Store {
         Ok(())
     }
 
+    /// The stored messages of `conversation`, the last ones, in send order.
+    pub fn messages(&self, conversation: &str) -> Result<Vec<gmd::Message>, Box<dyn Error>> {
+        let mut messages = Vec::new();
+        for data in self
+            .conn
+            .prepare(
+                "SELECT data FROM (SELECT data, sent_ms FROM messages WHERE conversation = ?1
+                 ORDER BY sent_ms DESC LIMIT ?2) ORDER BY sent_ms",
+            )?
+            .query_map(params![conversation, LOADED], |row| row.get::<_, String>(0))?
+        {
+            messages.push(serde_json::from_str(&data?)?);
+        }
+        Ok(messages)
+    }
+
+    /// Records that message `id` of `conversation` arrived live: still up to date if it was,
+    /// or if it is the last message the phone listed.
+    pub fn arrived(&self, conversation: &str, id: &str) -> rusqlite::Result<()> {
+        self.conn
+            .execute(
+                "UPDATE conversations SET latest = ?2, synced = ?2
+                 WHERE id = ?1 AND (synced IS latest OR latest = ?2)",
+                params![conversation, id],
+            )
+            .map(|_| ())
+    }
+
     /// Message `id`, if stored.
     pub fn message(&self, id: &str) -> Result<Option<gmd::Message>, Box<dyn Error>> {
         let data: Option<String> = self
@@ -298,6 +326,17 @@ mod tests {
             assert_eq!(store.changed().unwrap(), ["x", "y"], "new last message");
             store.fetched("x").unwrap();
             store.fetched("y").unwrap();
+            // Live: up to date if it was, whichever comes first, message or listing.
+            store.arrived("x", "3").unwrap();
+            store.save_conversations(&[latest("x", "3")]).unwrap();
+            store.save_conversations(&[latest("y", "4")]).unwrap();
+            store.arrived("y", "4").unwrap();
+            assert_eq!(store.changed().unwrap(), Vec::<String>::new());
+            // A message missed: changed.
+            store.save_conversations(&[latest("x", "6")]).unwrap();
+            store.arrived("x", "5").unwrap();
+            assert_eq!(store.changed().unwrap(), ["x"]);
+            store.fetched("x").unwrap();
             store
                 .save_messages("new", &[message("b", 20), message("a", 10)])
                 .unwrap();
