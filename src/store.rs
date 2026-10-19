@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::gmd;
 
 /// Version of the schema, in `PRAGMA user_version`.
-const SCHEMA: i64 = 2;
+const SCHEMA: i64 = 3;
 
 /// Messages loaded per conversation at start: the most recent ones.
 const LOADED: i64 = 1000;
@@ -26,6 +26,7 @@ pub struct Conversation {
     pub id: String,
     pub name: String,
     pub group: bool,
+    pub hidden: bool,
     pub messages: Vec<gmd::Message>,
 }
 
@@ -89,6 +90,12 @@ impl Store {
                  ALTER TABLE conversations ADD COLUMN synced TEXT;",
             )?;
         }
+        if version < 3 {
+            // Out of the inbox of the phone (archived, deleted…): not shown.
+            self.conn.execute_batch(
+                "ALTER TABLE conversations ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
         self.conn.pragma_update(None, "user_version", SCHEMA)
     }
 
@@ -96,12 +103,15 @@ impl Store {
     pub fn conversations(&self) -> Result<Vec<Conversation>, Box<dyn Error>> {
         let mut conversations = self
             .conn
-            .prepare("SELECT id, name, is_group FROM conversations ORDER BY timestamp_ms DESC")?
+            .prepare(
+                "SELECT id, name, is_group, hidden FROM conversations ORDER BY timestamp_ms DESC",
+            )?
             .query_map([], |row| {
                 Ok(Conversation {
                     id: row.get(0)?,
                     name: row.get(1)?,
                     group: row.get(2)?,
+                    hidden: row.get(3)?,
                     messages: Vec::new(),
                 })
             })?
@@ -125,14 +135,21 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut save = tx.prepare(
-                "INSERT INTO conversations (id, name, is_group, timestamp_ms, latest)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO conversations (id, name, is_group, timestamp_ms, latest, hidden)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (id) DO UPDATE SET name = ?2, is_group = ?3, timestamp_ms = ?4,
-                 latest = ?5",
+                 latest = ?5, hidden = ?6",
             )?;
             for c in conversations {
                 let latest = c.latest.as_ref().map(|l| &l.id);
-                save.execute(params![c.id, c.name, c.group, c.timestamp_ms, latest])?;
+                save.execute(params![
+                    c.id,
+                    c.name,
+                    c.group,
+                    c.timestamp_ms,
+                    latest,
+                    c.hidden
+                ])?;
             }
         }
         tx.commit()
@@ -144,9 +161,50 @@ impl Store {
         self.conn
             .prepare(
                 "SELECT id FROM conversations WHERE latest IS NOT NULL
-                 AND synced IS NOT latest ORDER BY timestamp_ms DESC",
+                 AND synced IS NOT latest AND NOT hidden ORDER BY timestamp_ms DESC",
             )?
             .query_map([], |row| row.get(0))?
+            .collect()
+    }
+
+    /// Hides the shown conversations missing from those `listed` by the phone although
+    /// as recent as `since` (deleted, or archived beyond the folders listed); returns them.
+    pub fn hide_unlisted(&self, listed: &[&str], since: i64) -> rusqlite::Result<Vec<String>> {
+        let candidates: Vec<String> = self
+            .conn
+            .prepare("SELECT id FROM conversations WHERE NOT hidden AND timestamp_ms >= ?1")?
+            .query_map([since], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let gone: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| !listed.contains(&id.as_str()))
+            .collect();
+        let mut hide = self
+            .conn
+            .prepare("UPDATE conversations SET hidden = 1 WHERE id = ?1")?;
+        for id in &gone {
+            hide.execute([id])?;
+        }
+        Ok(gone)
+    }
+
+    /// The conversations `ids`, without their messages.
+    pub fn conversations_hidden(&self, ids: &[String]) -> rusqlite::Result<Vec<Conversation>> {
+        let mut select = self
+            .conn
+            .prepare("SELECT id, name, is_group, hidden FROM conversations WHERE id = ?1")?;
+        ids.iter()
+            .map(|id| {
+                select.query_row([id], |row| {
+                    Ok(Conversation {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        group: row.get(2)?,
+                        hidden: row.get(3)?,
+                        messages: Vec::new(),
+                    })
+                })
+            })
             .collect()
     }
 
@@ -337,6 +395,19 @@ mod tests {
             store.arrived("x", "5").unwrap();
             assert_eq!(store.changed().unwrap(), ["x"]);
             store.fetched("x").unwrap();
+            // Hidden on the phone, or gone from it although recent: not fetched, nor shown.
+            let mut hidden = latest("h", "7");
+            hidden.hidden = true;
+            store.save_conversations(&[hidden]).unwrap();
+            assert_eq!(store.changed().unwrap(), Vec::<String>::new());
+            store.save_conversations(&[latest("y", "8")]).unwrap();
+            assert_eq!(store.hide_unlisted(&["x", "old", "new"], 0).unwrap(), ["y"]);
+            assert_eq!(
+                store.hide_unlisted(&["x", "old", "new"], 2).unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(store.changed().unwrap(), Vec::<String>::new());
+            assert!(store.conversations_hidden(&["y".to_string()]).unwrap()[0].hidden);
             store
                 .save_messages("new", &[message("b", 20), message("a", 10)])
                 .unwrap();
@@ -369,7 +440,9 @@ mod tests {
         let store = Store::open(&path, "secret").unwrap();
         let conversations = store.conversations().unwrap();
         let ids: Vec<_> = conversations.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["new", "old", "x", "y"], "most recent first");
+        assert_eq!(ids, ["new", "old", "x", "y", "h"], "most recent first");
+        let hidden: Vec<_> = conversations.iter().map(|c| c.hidden).collect();
+        assert_eq!(hidden, [false, false, false, true, true]);
         let messages = &conversations[0].messages;
         let texts: Vec<_> = messages.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, ["edited", "text of b"], "in send order");

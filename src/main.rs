@@ -232,11 +232,14 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 }
                 break None;
             }
-            Some(gmd::Event::Ready { conversations }) => {
+            Some(gmd::Event::Ready {
+                conversations,
+                since,
+            }) => {
                 if let Some(pairing) = pairing.take() {
                     pairing.finish();
                 }
-                break Some(conversations);
+                break Some((conversations, since));
             }
             Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
@@ -260,16 +263,26 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         commands: commands.clone(),
         known: discussions.iter().map(|d| d.id.clone()).collect(),
     };
-    if let Some(conversations) = ready {
-        discussions.extend(sync.ready(conversations));
+    // What changed since last time (hidden, renamed, read on the phone): the first events.
+    let mut changes = Vec::new();
+    if let Some((conversations, since)) = ready {
+        for event in sync.ready(conversations, since) {
+            match event {
+                Event::Chat(discussion) if !discussions.iter().any(|d| d.id == discussion.id) => {
+                    discussions.push(discussion)
+                }
+                event => changes.push(event),
+            }
+        }
     }
     let backend = GMessages {
         commands,
         store,
         waiting: Waiting::default(),
         next_id: Cell::new(0),
+        read: RefCell::default(),
     };
-    let events = events(lines, sync, backend.waiting.clone());
+    let events = events(lines, sync, backend.waiting.clone(), changes);
     let result = chat_tui::run(backend, discussions, events, config).await;
     control.stop().await;
     Ok(result?)
@@ -284,22 +297,29 @@ struct Sync {
 }
 
 impl Sync {
-    /// The conversations listed by the phone: stored, the messages of those that changed
-    /// fetched. Returns the discussions of those not known yet.
-    fn ready(&mut self, conversations: Vec<gmd::Conversation>) -> Vec<Discussion> {
+    /// The conversations listed by the phone (inbox, then hidden, the inbox complete from
+    /// `since`): stored, the messages of those that changed fetched. Returns them as
+    /// interface events: those not known yet, the others updated, those read on the phone,
+    /// and those gone from the phone (deleted) hidden.
+    fn ready(&mut self, conversations: Vec<gmd::Conversation>, since: i64) -> Vec<Event> {
         if let Err(e) = self.store.save_conversations(&conversations) {
             pair::say(&format!("Cannot store the conversations: {e}"));
         }
+        let listed: Vec<&str> = conversations.iter().map(|c| c.id.as_str()).collect();
+        let gone = self.store.hide_unlisted(&listed, since).unwrap_or_default();
         let changed = self.store.changed().unwrap_or_default();
         if !changed.is_empty() {
             self.commands
                 .send(serde_json::json!({"cmd": "fetch", "conversations": changed}));
         }
-        conversations
-            .into_iter()
-            .filter(|c| self.known.insert(c.id.clone()))
-            .map(discussion)
-            .collect()
+        let mut events = Vec::new();
+        for conversation in conversations {
+            events.extend(self.conversation(conversation));
+        }
+        for conversation in self.store.conversations_hidden(&gone).unwrap_or_default() {
+            events.push(Event::Chat(stored_discussion(conversation)));
+        }
+        events
     }
 
     /// A message arriving live: stored, then shown, as new (notified) unless known already or
@@ -330,26 +350,31 @@ impl Sync {
 
     /// A conversation new or changed: stored; the discussion of a new one, with what is
     /// stored of it.
-    fn conversation(&mut self, conversation: gmd::Conversation) -> Option<Discussion> {
-        if let Err(e) = self
-            .store
-            .save_conversations(std::slice::from_ref(&conversation))
-        {
-            pair::say(&format!("Cannot store the conversation: {e}"));
-        }
-        if !self.known.insert(conversation.id.clone()) {
-            return None;
-        }
-        let messages = self.store.messages(&conversation.id).unwrap_or_default();
-        if messages.is_empty() {
-            return Some(discussion(conversation));
-        }
-        Some(stored_discussion(store::Conversation {
-            id: conversation.id,
-            name: conversation.name,
-            group: conversation.group,
-            messages,
-        }))
+    /// A conversation new or changed on the phone, as interface events: the discussion (new,
+    /// or its title and visibility for a known one), then whether it was read there.
+    fn conversation(&mut self, conversation: gmd::Conversation) -> Vec<Event> {
+        let read = (!conversation.unread).then(|| Event::Read {
+            chat: conversation.id.clone(),
+        });
+        let messages = if self.known.insert(conversation.id.clone()) {
+            self.store.messages(&conversation.id).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let discussion = if messages.is_empty() {
+            discussion(conversation)
+        } else {
+            stored_discussion(store::Conversation {
+                id: conversation.id,
+                name: conversation.name,
+                group: conversation.group,
+                hidden: conversation.hidden,
+                messages,
+            })
+        };
+        std::iter::once(Event::Chat(discussion))
+            .chain(read)
+            .collect()
     }
 
     /// Messages of `conversation`: stored, then as the interface shows them.
@@ -373,6 +398,7 @@ impl Sync {
 fn stored_discussion(conversation: store::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
+    discussion.hidden = conversation.hidden;
     let messages: Vec<_> = conversation.messages.into_iter().map(message).collect();
     let index: HashMap<MessageId, usize> = messages
         .iter()
@@ -394,6 +420,7 @@ fn stored_discussion(conversation: store::Conversation) -> Discussion {
 fn discussion(conversation: gmd::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
+    discussion.hidden = conversation.hidden;
     if let Some(latest) = conversation.latest {
         let sent_ms = conversation.timestamp_ms.max(0) as u64;
         let mut message = Message::mine(latest.id, latest.text, None, false);
@@ -462,14 +489,21 @@ fn events(
     mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
     mut sync: Sync,
     waiting: Waiting,
+    first: Vec<Event>,
 ) -> UnboundedReceiver<Event> {
     let (events, received) = unbounded();
+    for event in first {
+        let _ = events.unbounded_send(event);
+    }
     tokio::task::spawn_local(async move {
         while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
             let event = match event {
-                gmd::Event::Ready { conversations } => {
-                    for discussion in sync.ready(conversations) {
-                        if events.unbounded_send(Event::Chat(discussion)).is_err() {
+                gmd::Event::Ready {
+                    conversations,
+                    since,
+                } => {
+                    for event in sync.ready(conversations, since) {
+                        if events.unbounded_send(event).is_err() {
                             return;
                         }
                     }
@@ -518,10 +552,18 @@ fn events(
                     old,
                 } => sync.live(conversation, message, old),
                 gmd::Event::Conversation { conversation } => {
-                    match sync.conversation(conversation) {
-                        Some(discussion) => Event::Chat(discussion),
-                        None => continue,
+                    if let Err(e) = sync
+                        .store
+                        .save_conversations(std::slice::from_ref(&conversation))
+                    {
+                        pair::say(&format!("Cannot store the conversation: {e}"));
                     }
+                    for event in sync.conversation(conversation) {
+                        if events.unbounded_send(event).is_err() {
+                            return;
+                        }
+                    }
+                    continue;
                 }
                 gmd::Event::Typing {
                     conversation,
@@ -616,6 +658,8 @@ struct GMessages {
     store: Rc<store::Store>,
     waiting: Waiting,
     next_id: Cell<u64>,
+    /// The last message said read on the phone, per conversation.
+    read: RefCell<HashMap<ChatId, MessageId>>,
 }
 
 impl GMessages {
@@ -691,6 +735,19 @@ impl Backend for GMessages {
         _message: &Message,
     ) -> impl Future<Output = Result<()>> + 'static {
         async { Err("deletion is not implemented yet".into()) }
+    }
+
+    /// Said to the phone, once per last message.
+    fn read(&self, chat: &ChatId, last: &Message) {
+        if last.id.is_empty() || self.read.borrow().get(chat) == Some(&last.id) {
+            return;
+        }
+        self.read.borrow_mut().insert(chat.clone(), last.id.clone());
+        self.commands.send(serde_json::json!({
+            "cmd": "read",
+            "conversation": chat,
+            "up_to": last.id,
+        }));
     }
 
     /// From the store if downloaded already; else by gmd, then stored.

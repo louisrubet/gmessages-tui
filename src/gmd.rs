@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 5;
+const PROTOCOL: u32 = 6;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -44,8 +44,11 @@ pub enum Event {
     Paired,
     /// Connected and active: the phone answers now, the conversations follow.
     Connected,
+    /// `since`: the time from which every conversation of the inbox is listed (0: all are).
     Ready {
         conversations: Vec<Conversation>,
+        #[serde(default)]
+        since: i64,
     },
     /// The media of a message, for the `download` command of the same `id`.
     Downloaded {
@@ -101,6 +104,12 @@ pub struct Conversation {
     pub group: bool,
     pub timestamp_ms: i64,
     pub latest: Option<Latest>,
+    /// Not in the inbox of the phone: archived, deleted, spam…
+    #[serde(default)]
+    pub hidden: bool,
+    /// Not read on the phone.
+    #[serde(default)]
+    pub unread: bool,
 }
 
 /// A message of a conversation, as gmd says it and the store keeps it.

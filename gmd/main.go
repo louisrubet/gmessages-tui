@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 5
+const protocol = 6
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -103,6 +103,10 @@ type Conversation struct {
 	Group       bool    `json:"group"`
 	TimestampMS int64   `json:"timestamp_ms"`
 	Latest      *Latest `json:"latest,omitempty"`
+	// Not in the inbox of the phone: archived, deleted, spam, blocked…
+	Hidden bool `json:"hidden,omitempty"`
+	// Read on the phone up to its last message: false.
+	Unread bool `json:"unread"`
 }
 
 // Latest is the last message of a conversation, as the phone summarizes it.
@@ -131,6 +135,8 @@ type Command struct {
 	Text         string       `json:"text,omitempty"`
 	Reply        string       `json:"reply,omitempty"`
 	Attachments  []Attachment `json:"attachments,omitempty"`
+	// For "read": the conversation (above) is read up to this message.
+	UpTo string `json:"up_to,omitempty"`
 }
 
 // Attachment is a downloaded medium.
@@ -440,6 +446,9 @@ func (g *gmd) expired(err error) {
 	emit("expired", map[string]any{"message": "the Google session has ended (signed out?)"})
 }
 
+// listConversations says the conversations of the inbox, then those archived or in spam
+// (hidden): "ready", with `since` the time from which every inbox conversation is listed
+// (0: all of them are).
 func (g *gmd) listConversations() {
 	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
 		Count:  conversationCount,
@@ -450,8 +459,31 @@ func (g *gmd) listConversations() {
 		emit("status", map[string]any{"message": "cannot list the conversations: " + err.Error()})
 		return
 	}
+	convs := resp.GetConversations()
+	var since int64
+	if len(convs) >= conversationCount {
+		since = convs[0].GetLastMessageTimestamp()
+		for _, c := range convs {
+			since = min(since, c.GetLastMessageTimestamp())
+		}
+		since /= 1000
+	}
+	for _, folder := range []gmproto.ListConversationsRequest_Folder{
+		gmproto.ListConversationsRequest_ARCHIVE,
+		gmproto.ListConversationsRequest_SPAM_BLOCKED,
+	} {
+		resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
+			Count:  conversationCount,
+			Folder: folder,
+		})
+		if err != nil {
+			g.logger.Err(err).Str("folder", folder.String()).Msg("cannot list the conversations")
+			continue
+		}
+		convs = append(convs, resp.GetConversations()...)
+	}
 	g.lock.Lock()
-	for _, c := range resp.GetConversations() {
+	for _, c := range convs {
 		g.convs[c.GetConversationID()] = c
 		for _, p := range c.GetParticipants() {
 			if p.GetIsMe() && p.GetID().GetParticipantID() != "" {
@@ -460,7 +492,7 @@ func (g *gmd) listConversations() {
 		}
 	}
 	g.lock.Unlock()
-	emit("ready", map[string]any{"conversations": conversations(resp.GetConversations())})
+	emit("ready", map[string]any{"conversations": conversations(convs), "since": since})
 }
 
 // fetch fetches the last messages of the conversations ids, in order, a few at a time: one
@@ -518,6 +550,12 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.download(cmd.ID, cmd.Message, cmd.Media)
 		case "fetch":
 			go g.fetch(cmd.Conversations)
+		case "read":
+			go func() {
+				if err := g.client.MarkRead(g.ctx, cmd.Conversation, cmd.UpTo); err != nil {
+					g.logger.Err(err).Str("conversation", cmd.Conversation).Msg("cannot mark read")
+				}
+			}()
 		case "send":
 			go func() {
 				msg, err := g.send(cmd)
@@ -885,6 +923,8 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 			Name:        c.GetName(),
 			Group:       c.GetIsGroupChat(),
 			TimestampMS: c.GetLastMessageTimestamp() / 1000,
+			Hidden:      hidden(c.GetStatus()),
+			Unread:      c.GetUnread(),
 		}
 		if latest := c.GetLatestMessage(); latest != nil {
 			conv.Latest = &Latest{
@@ -897,6 +937,17 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 		list = append(list, conv)
 	}
 	return list
+}
+
+// hidden says whether a conversation of this status is out of the inbox.
+func hidden(status gmproto.ConversationStatus) bool {
+	switch status {
+	case gmproto.ConversationStatus_ARCHIVED, gmproto.ConversationStatus_KEEP_ARCHIVED,
+		gmproto.ConversationStatus_DELETED, gmproto.ConversationStatus_SPAM_FOLDER,
+		gmproto.ConversationStatus_BLOCKED_FOLDER, gmproto.ConversationStatus_TRASH_FOLDER:
+		return true
+	}
+	return false
 }
 
 // loadSession reads the session saved by a previous pairing; nil when there is none.
