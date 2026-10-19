@@ -88,6 +88,7 @@ Sending reactions (`e`) and deleting (`Del`) are not implemented yet.
 ## Good to know
 
 - **History**: at start, the interface opens on the store once connected (or after 10 s, to read offline). Only conversations with new messages are fetched again, their last 30 messages.
+- **Phone sync**: conversations archived, deleted, in spam or blocked on the phone are hidden (back on a new message); renames show at once; reading a chat here marks it read on the phone, and the other way round.
 - **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`. Downloaded media are stored.
 - **Formatting**: RCS and SMS have none; `**bold**` and the like are sent as plain text.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
