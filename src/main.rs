@@ -248,6 +248,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 | gmd::Event::Connected
                 | gmd::Event::History { .. }
                 | gmd::Event::Downloaded { .. }
+                | gmd::Event::Done { .. }
                 | gmd::Event::Sent { .. }
                 | gmd::Event::Message { .. }
                 | gmd::Event::Conversation { .. }
@@ -262,6 +263,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         store: store.clone(),
         commands: commands.clone(),
         known: discussions.iter().map(|d| d.id.clone()).collect(),
+        read: HashSet::new(),
     };
     // What changed since last time (hidden, renamed, read on the phone): the first events.
     let mut changes = Vec::new();
@@ -294,6 +296,8 @@ struct Sync {
     commands: gmd::Commands,
     /// The conversations the interface has.
     known: HashSet<ChatId>,
+    /// The conversations read on the phone: still read once their messages come.
+    read: HashSet<ChatId>,
 }
 
 impl Sync {
@@ -353,9 +357,15 @@ impl Sync {
     /// A conversation new or changed on the phone, as interface events: the discussion (new,
     /// or its title and visibility for a known one), then whether it was read there.
     fn conversation(&mut self, conversation: gmd::Conversation) -> Vec<Event> {
-        let read = (!conversation.unread).then(|| Event::Read {
-            chat: conversation.id.clone(),
-        });
+        let read = if conversation.unread {
+            self.read.remove(&conversation.id);
+            None
+        } else {
+            self.read.insert(conversation.id.clone());
+            Some(Event::Read {
+                chat: conversation.id.clone(),
+            })
+        };
         let messages = if self.known.insert(conversation.id.clone()) {
             self.store.messages(&conversation.id).unwrap_or_default()
         } else {
@@ -509,6 +519,12 @@ fn events(
                     }
                     continue;
                 }
+                gmd::Event::Done { id, error } => {
+                    if let Some(done) = waiting.actions.borrow_mut().remove(&id) {
+                        let _ = done.send(error.map_or(Ok(()), Err));
+                    }
+                    continue;
+                }
                 gmd::Event::Downloaded {
                     id,
                     attachments,
@@ -579,10 +595,21 @@ fn events(
                 gmd::Event::History {
                     conversation,
                     messages,
-                } => Event::History {
-                    messages: sync.history(&conversation, messages),
-                    chat: conversation,
-                },
+                } => {
+                    let read = sync.read.contains(&conversation).then(|| Event::Read {
+                        chat: conversation.clone(),
+                    });
+                    let history = Event::History {
+                        messages: sync.history(&conversation, messages),
+                        chat: conversation,
+                    };
+                    for event in std::iter::once(history).chain(read) {
+                        if events.unbounded_send(event).is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 gmd::Event::Status { message } => Event::Status(message),
                 gmd::Event::Expired { message } => Event::Status(format!(
                     "Disconnected: {message}. Restart {NAME} to sign in again"
@@ -610,11 +637,12 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// Requests waiting for gmd's answer, by request id.
 type Pending<T> = Rc<RefCell<HashMap<u64, oneshot::Sender<std::result::Result<T, String>>>>>;
 
-/// What waits for gmd: downloads, messages being sent.
+/// What waits for gmd: downloads, messages being sent, conversations archived or deleted.
 #[derive(Clone, Default)]
 struct Waiting {
     downloads: Pending<Vec<Attachment>>,
     sends: Pending<gmd::Message>,
+    actions: Pending<()>,
 }
 
 /// Waits for the answer to request `id` of `pending`, sent if `sent`.
@@ -650,6 +678,8 @@ async fn answer<T>(
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long sending may take (uploading attachments included).
 const SEND_TIMEOUT: Duration = Duration::from_secs(120);
+/// Archiving or deleting a conversation, given up after.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Google Messages, for the interface: shows the conversations and downloads their media
 /// so far.
@@ -663,6 +693,18 @@ struct GMessages {
 }
 
 impl GMessages {
+    /// Asks gmd to `archive` or `delete_chat` `chat`, until it is done.
+    fn chat_action(&self, cmd: &str, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
+        let id = self.request();
+        let (done, done_rx) = oneshot::channel();
+        self.waiting.actions.borrow_mut().insert(id, done);
+        let sent = self
+            .commands
+            .send(serde_json::json!({"cmd": cmd, "id": id, "conversation": chat}));
+        let actions = self.waiting.actions.clone();
+        async move { answer(&actions, id, done_rx, sent, ACTION_TIMEOUT).await }
+    }
+
     /// A new request id.
     fn request(&self) -> u64 {
         let id = self.next_id.get() + 1;
@@ -676,7 +718,25 @@ impl GMessages {
 #[allow(clippy::manual_async_fn)]
 impl Backend for GMessages {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities {
+            chat_actions: true,
+            ..Capabilities::default()
+        }
+    }
+
+    fn archive(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
+        self.chat_action("archive", chat)
+    }
+
+    /// On the phone, then its messages and media in the store.
+    fn delete_chat(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
+        let done = self.chat_action("delete_chat", chat);
+        let (store, chat) = (self.store.clone(), chat.clone());
+        async move {
+            done.await?;
+            store.forget(&chat)?;
+            Ok(())
+        }
     }
 
     /// Sent by gmd, then stored with its attachments: as the phone echoed it, with its id.

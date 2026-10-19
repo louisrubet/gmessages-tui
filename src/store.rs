@@ -208,6 +208,25 @@ impl Store {
             .collect()
     }
 
+    /// Forgets the messages and media of `conversation` (deleted), and hides it.
+    pub fn forget(&self, conversation: &str) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM attachments WHERE message IN
+             (SELECT id FROM messages WHERE conversation = ?1)",
+            [conversation],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE conversation = ?1",
+            [conversation],
+        )?;
+        tx.execute(
+            "UPDATE conversations SET hidden = 1 WHERE id = ?1",
+            [conversation],
+        )?;
+        tx.commit()
+    }
+
     /// Records that `conversation` was fetched: up to date with its last message.
     pub fn fetched(&self, conversation: &str) -> rusqlite::Result<()> {
         self.conn
@@ -450,6 +469,11 @@ mod tests {
         assert!(messages[0].reactions[0].mine);
         assert_eq!(store.changed().unwrap(), Vec::<String>::new());
         assert_eq!(store.message("b").unwrap().unwrap().sender, "Ann");
+        store.forget("new").unwrap();
+        let conversations = store.conversations().unwrap();
+        assert!(conversations[0].hidden && conversations[0].messages.is_empty());
+        assert!(store.message("b").unwrap().is_none(), "messages forgotten");
+        assert!(store.attachments("b").unwrap().is_none(), "media forgotten");
 
         drop(store);
         for suffix in ["", "-wal", "-shm"] {

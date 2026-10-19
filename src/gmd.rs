@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 6;
+const PROTOCOL: u32 = 7;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -55,6 +55,11 @@ pub enum Event {
         id: u64,
         #[serde(default)]
         attachments: Vec<Attachment>,
+        error: Option<String>,
+    },
+    /// The `archive` or `delete_chat` command of the same `id` done, or failed.
+    Done {
+        id: u64,
         error: Option<String>,
     },
     /// The message sent by the `send` command of the same `id`, as the phone echoed it.

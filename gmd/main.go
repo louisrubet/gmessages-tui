@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 6
+const protocol = 7
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -122,7 +122,8 @@ type Command struct {
 	Cmd string `json:"cmd"`
 	// For "pair_google": the cookies of a browser signed in to the Google account.
 	Cookies map[string]string `json:"cookies,omitempty"`
-	// For "download": the request, answered by a "downloaded" event of the same id, the
+	// For "download": the request, answered by a "downloaded" event of the same id ("done"
+	// for "archive" and "delete_chat", of the conversation below), the
 	// message and its media to download.
 	ID      uint64   `json:"id,omitempty"`
 	Message string   `json:"message,omitempty"`
@@ -550,6 +551,20 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.download(cmd.ID, cmd.Message, cmd.Media)
 		case "fetch":
 			go g.fetch(cmd.Conversations)
+		case "archive", "delete_chat":
+			go func() {
+				var err error
+				if cmd.Cmd == "archive" {
+					err = g.archive(cmd.Conversation)
+				} else {
+					err = g.deleteChat(cmd.Conversation)
+				}
+				if err != nil {
+					emit("done", map[string]any{"id": cmd.ID, "error": err.Error()})
+				} else {
+					emit("done", map[string]any{"id": cmd.ID})
+				}
+			}()
 		case "read":
 			go func() {
 				if err := g.client.MarkRead(g.ctx, cmd.Conversation, cmd.UpTo); err != nil {
@@ -937,6 +952,61 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 		list = append(list, conv)
 	}
 	return list
+}
+
+// archive moves the conversation id out of the inbox of the phone.
+func (g *gmd) archive(id string) error {
+	resp, err := g.client.UpdateConversation(g.ctx, &gmproto.UpdateConversationRequest{
+		ConversationID: id,
+		Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
+			ConversationID: id,
+			Data:           &gmproto.UpdateConversationData_Status{Status: gmproto.ConversationStatus_ARCHIVED},
+		}},
+	})
+	if err != nil {
+		return err
+	} else if !resp.GetSuccess() {
+		return errors.New("refused by the phone")
+	}
+	return nil
+}
+
+// deleteChat deletes the conversation id and its messages on the phone. The phone wants
+// the number of the other person of a one-to-one conversation.
+func (g *gmd) deleteChat(id string) error {
+	g.lock.Lock()
+	conv := g.convs[id]
+	g.lock.Unlock()
+	if conv == nil {
+		var err error
+		if conv, err = g.client.GetConversation(g.ctx, id); err != nil {
+			return err
+		}
+	}
+	var phone *string
+	if !conv.GetIsGroupChat() {
+		for _, p := range conv.GetParticipants() {
+			if p.GetIsVisible() && !p.GetIsMe() && p.GetID().GetNumber() != "" {
+				number := p.GetID().GetNumber()
+				phone = &number
+				break
+			}
+		}
+	}
+	resp, err := g.client.UpdateConversation(g.ctx, &gmproto.UpdateConversationRequest{
+		Action:         gmproto.ConversationActionStatus_DELETE,
+		ConversationID: id,
+		Data: &gmproto.UpdateConversationRequest_DeleteData{DeleteData: &gmproto.DeleteConversationData{
+			ConversationID: id,
+			Phone:          phone,
+		}},
+	})
+	if err != nil {
+		return err
+	} else if !resp.GetSuccess() {
+		return errors.New("refused by the phone")
+	}
+	return nil
 }
 
 // hidden says whether a conversation of this status is out of the inbox.

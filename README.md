@@ -79,11 +79,13 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `o` | open the links and images of the selected message |
 | `Ctrl+V` | paste the image in the clipboard |
 | `P` | pin / unpin the selected chat |
+| `a` | archive the selected chat (from the chat list) |
+| `Del` | delete the selected chat and its messages (from the chat list, confirmed) |
 | `p` | parameters (from the chat list) |
 | `Esc` | unselect, back, give up a stuck send |
 | `q` | quit |
 
-Sending reactions (`e`) and deleting (`Del`) are not implemented yet.
+Sending reactions (`e`) and deleting a message (`Del` in a chat) are not implemented yet.
 
 ## Good to know
 
