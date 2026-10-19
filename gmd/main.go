@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 8
+const protocol = 9
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -130,7 +130,8 @@ type Command struct {
 	ID      uint64   `json:"id,omitempty"`
 	Message string   `json:"message,omitempty"`
 	Media   []Medium `json:"media,omitempty"`
-	// For "fetch": the conversations whose last messages to fetch.
+	// For "fetch": the conversations whose last messages to fetch; for "lookup", those to
+	// ask about.
 	Conversations []string `json:"conversations,omitempty"`
 	// For "send" (answered by a "sent" event of the same id): the conversation, the text,
 	// the message it replies to and the attachments.
@@ -514,6 +515,26 @@ func (g *gmd) listConversations() {
 	emit("ready", map[string]any{"conversations": conversations(convs), "since": since})
 }
 
+// lookup asks the phone about the conversations ids, missing from its lists (in the trash,
+// or deleted): "conversation" for those it has, "gone" for those it has not.
+func (g *gmd) lookup(ids []string) {
+	for _, id := range ids {
+		conv, err := g.client.GetConversation(g.ctx, id)
+		switch {
+		case err != nil:
+			g.logger.Err(err).Str("conversation", id).Msg("cannot look the conversation up")
+		case conv == nil || conv.GetConversationID() == "" ||
+			conv.GetStatus() == gmproto.ConversationStatus_DELETED:
+			emit("gone", map[string]any{"conversation": id})
+		default:
+			g.lock.Lock()
+			g.convs[id] = conv
+			g.lock.Unlock()
+			emit("conversation", map[string]any{"conversation": conversations([]*gmproto.Conversation{conv})[0]})
+		}
+	}
+}
+
 // fetch fetches the last messages of the conversations ids, in order, a few at a time: one
 // "history" event each.
 func (g *gmd) fetch(ids []string) {
@@ -569,6 +590,8 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.download(cmd.ID, cmd.Message, cmd.Media)
 		case "fetch":
 			go g.fetch(cmd.Conversations)
+		case "lookup":
+			go g.lookup(cmd.Conversations)
 		case "archive", "restore", "delete_chat":
 			go func() {
 				var err error

@@ -92,7 +92,7 @@ Sending reactions (`e`) and deleting a message (`Del` in a chat) are not impleme
 
 - **History**: at start, the interface opens on the store once connected (or after 10 s, to read offline). Only conversations with new messages are fetched again, their last 30 messages.
 - **Folders**: *Archive*, *Spam & blocked* and *Trash* show under the chats when not empty; `Enter` opens one, `Esc` goes back.
-- **Phone sync**: conversations archived, trashed, in spam or blocked on the phone move to their folder, those deleted for good go (with their messages here); renames show at once; reading a chat here marks it read on the phone, and the other way round. The trash is listed by the phone only if it allows it: otherwise it holds what was trashed while gmessages-tui ran.
+- **Phone sync**: conversations archived, trashed, in spam or blocked on the phone move to their folder, those deleted for good go (with their messages here); renames show at once; reading a chat here marks it read on the phone, and the other way round. The phone does not list its trash: at start, the conversations missing from its lists are asked about one by one.
 - **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`. Downloaded media are stored.
 - **Formatting**: RCS and SMS have none; `**bold**` and the like are sent as plain text.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.

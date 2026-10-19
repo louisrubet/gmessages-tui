@@ -179,14 +179,13 @@ impl Store {
             .collect()
     }
 
-    /// Forgets the shown conversations missing from those `listed` by the phone although
-    /// as recent as `since` (deleted), but those in the trash, maybe not listed; returns
-    /// them.
-    pub fn hide_unlisted(&self, listed: &[&str], since: i64) -> rusqlite::Result<Vec<String>> {
+    /// The conversations missing from those `listed` by the phone although as recent as
+    /// `since`: in the trash (not listed), or deleted.
+    pub fn unlisted(&self, listed: &[&str], since: i64) -> rusqlite::Result<Vec<String>> {
         let candidates: Vec<String> = self
             .conn
             .prepare(
-                "SELECT id FROM conversations WHERE NOT hidden AND timestamp_ms >= ?1
+                "SELECT id FROM conversations WHERE timestamp_ms >= ?1
                  AND folder IS NOT 'trash'",
             )?
             .query_map([since], |row| row.get(0))?
@@ -195,9 +194,6 @@ impl Store {
             .into_iter()
             .filter(|id| !listed.contains(&id.as_str()))
             .collect();
-        for id in &gone {
-            self.forget(id)?;
-        }
         Ok(gone)
     }
 
@@ -222,7 +218,8 @@ impl Store {
             .collect()
     }
 
-    /// Forgets the messages and media of `conversation` (deleted), and hides it.
+    /// Forgets the messages and media of `conversation` (deleted), and hides it (fetched
+    /// again if it comes back).
     pub fn forget(&self, conversation: &str) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
@@ -235,7 +232,7 @@ impl Store {
             [conversation],
         )?;
         tx.execute(
-            "UPDATE conversations SET hidden = 1 WHERE id = ?1",
+            "UPDATE conversations SET hidden = 1, synced = NULL WHERE id = ?1",
             [conversation],
         )?;
         tx.commit()
@@ -428,8 +425,8 @@ mod tests {
             store.arrived("x", "5").unwrap();
             assert_eq!(store.changed().unwrap(), ["x"]);
             store.fetched("x").unwrap();
-            // Deleted on the phone, or gone from it although recent: not fetched, nor shown.
-            // In the trash (maybe not listed): kept.
+            // Deleted on the phone: not fetched, nor shown. Missing from its lists although
+            // recent: to ask about, but those in the trash (maybe not listed).
             let mut deleted = latest("h", "7");
             deleted.deleted = true;
             store.save_conversations(&[deleted]).unwrap();
@@ -439,13 +436,24 @@ mod tests {
             store.save_conversations(&[trashed]).unwrap();
             store.fetched("t").unwrap();
             store.save_conversations(&[latest("y", "8")]).unwrap();
-            assert_eq!(store.hide_unlisted(&["x", "old", "new"], 0).unwrap(), ["y"]);
+            store.fetched("y").unwrap();
+            let mut unlisted = store.unlisted(&["x", "old", "new"], 0).unwrap();
+            unlisted.sort();
+            assert_eq!(unlisted, ["h", "y"]);
             assert_eq!(
-                store.hide_unlisted(&["x", "old", "new"], 2).unwrap(),
+                store.unlisted(&["x", "old", "new"], 2).unwrap(),
                 Vec::<String>::new()
             );
             assert_eq!(store.changed().unwrap(), Vec::<String>::new());
+            // Gone: forgotten. Found in the trash after all: fetched again.
+            store.forget("y").unwrap();
             assert!(store.conversations_hidden(&["y".to_string()]).unwrap()[0].hidden);
+            assert_eq!(store.changed().unwrap(), Vec::<String>::new());
+            let mut found = latest("y", "8");
+            found.folder = Some("trash".to_string());
+            store.save_conversations(&[found]).unwrap();
+            assert_eq!(store.changed().unwrap(), ["y"]);
+            store.fetched("y").unwrap();
             store
                 .save_messages("new", &[message("b", 20), message("a", 10)])
                 .unwrap();
@@ -483,14 +491,17 @@ mod tests {
             .iter()
             .filter(|c| !c.hidden)
             .map(|c| (c.id.as_str(), c.folder.as_deref()))
-            .collect();
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
         assert_eq!(
             shown,
             [
                 ("new", None),
                 ("old", None),
+                ("t", Some("trash")),
                 ("x", None),
-                ("t", Some("trash"))
+                ("y", Some("trash"))
             ]
         );
         let messages = &conversations[0].messages;

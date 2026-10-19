@@ -249,6 +249,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 | gmd::Event::History { .. }
                 | gmd::Event::Downloaded { .. }
                 | gmd::Event::Done { .. }
+                | gmd::Event::Gone { .. }
                 | gmd::Event::Sent { .. }
                 | gmd::Event::Message { .. }
                 | gmd::Event::Conversation { .. }
@@ -264,6 +265,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         commands: commands.clone(),
         known: discussions.iter().map(|d| d.id.clone()).collect(),
         read: HashSet::new(),
+        looked_up: HashSet::new(),
     };
     // What changed since last time (hidden, renamed, read on the phone): the first events.
     let mut changes = Vec::new();
@@ -298,19 +300,26 @@ struct Sync {
     known: HashSet<ChatId>,
     /// The conversations read on the phone: still read once their messages come.
     read: HashSet<ChatId>,
+    /// The conversations asked about to the phone, missing from its lists.
+    looked_up: HashSet<ChatId>,
 }
 
 impl Sync {
     /// The conversations listed by the phone (inbox, then hidden, the inbox complete from
     /// `since`): stored, the messages of those that changed fetched. Returns them as
-    /// interface events: those not known yet, the others updated, those read on the phone,
-    /// and those gone from the phone (deleted) hidden.
+    /// interface events: those not known yet, the others updated, those read on the phone.
+    /// Those missing from the lists are asked about (in the trash, or deleted).
     fn ready(&mut self, conversations: Vec<gmd::Conversation>, since: i64) -> Vec<Event> {
         if let Err(e) = self.store.save_conversations(&conversations) {
             pair::say(&format!("Cannot store the conversations: {e}"));
         }
         let listed: Vec<&str> = conversations.iter().map(|c| c.id.as_str()).collect();
-        let gone = self.store.hide_unlisted(&listed, since).unwrap_or_default();
+        let unlisted = self.store.unlisted(&listed, since).unwrap_or_default();
+        if !unlisted.is_empty() {
+            self.looked_up.extend(unlisted.iter().cloned());
+            self.commands
+                .send(serde_json::json!({"cmd": "lookup", "conversations": unlisted}));
+        }
         let changed = self.store.changed().unwrap_or_default();
         if !changed.is_empty() {
             self.commands
@@ -320,10 +329,21 @@ impl Sync {
         for conversation in conversations {
             events.extend(self.conversation(conversation));
         }
-        for conversation in self.store.conversations_hidden(&gone).unwrap_or_default() {
-            events.push(Event::Chat(stored_discussion(conversation)));
-        }
         events
+    }
+
+    /// A conversation looked up the phone no longer has: forgotten, and hidden.
+    fn gone(&mut self, conversation: &str) -> Option<Event> {
+        self.looked_up.remove(conversation);
+        if let Err(e) = self.store.forget(conversation) {
+            pair::say(&format!("Cannot forget the conversation: {e}"));
+        }
+        let gone = self
+            .store
+            .conversations_hidden(&[conversation.to_string()])
+            .ok()?
+            .pop()?;
+        Some(Event::Chat(stored_discussion(gone)))
     }
 
     /// A message arriving live: stored, then shown, as new (notified) unless known already or
@@ -584,12 +604,28 @@ fn events(
                     message,
                     old,
                 } => sync.live(conversation, message, old),
+                gmd::Event::Gone { conversation } => match sync.gone(&conversation) {
+                    Some(event) => event,
+                    None => continue,
+                },
                 gmd::Event::Conversation { conversation } => {
                     if let Err(e) = sync
                         .store
                         .save_conversations(std::slice::from_ref(&conversation))
                     {
                         pair::say(&format!("Cannot store the conversation: {e}"));
+                    }
+                    // Found in the trash: its messages, forgotten if it was taken as deleted.
+                    if sync.looked_up.remove(&conversation.id)
+                        && !conversation.deleted
+                        && sync
+                            .store
+                            .changed()
+                            .is_ok_and(|c| c.contains(&conversation.id))
+                    {
+                        sync.commands.send(
+                            serde_json::json!({"cmd": "fetch", "conversations": [&conversation.id]}),
+                        );
                     }
                     for event in sync.conversation(conversation) {
                         if events.unbounded_send(event).is_err() {
