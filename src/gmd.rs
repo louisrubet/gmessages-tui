@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 7;
+const PROTOCOL: u32 = 8;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -109,9 +109,12 @@ pub struct Conversation {
     pub group: bool,
     pub timestamp_ms: i64,
     pub latest: Option<Latest>,
-    /// Not in the inbox of the phone: archived, deleted, spam…
+    /// Out of the inbox of the phone: "archive", "spam" (or blocked), "trash".
     #[serde(default)]
-    pub hidden: bool,
+    pub folder: Option<String>,
+    /// Deleted for good.
+    #[serde(default)]
+    pub deleted: bool,
     /// Not read on the phone.
     #[serde(default)]
     pub unread: bool,

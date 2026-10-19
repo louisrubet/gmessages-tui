@@ -31,7 +31,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 7
+const protocol = 8
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -103,8 +103,10 @@ type Conversation struct {
 	Group       bool    `json:"group"`
 	TimestampMS int64   `json:"timestamp_ms"`
 	Latest      *Latest `json:"latest,omitempty"`
-	// Not in the inbox of the phone: archived, deleted, spam, blocked…
-	Hidden bool `json:"hidden,omitempty"`
+	// Out of the inbox of the phone: "archive", "spam" (or blocked), "trash".
+	Folder string `json:"folder,omitempty"`
+	// Deleted for good.
+	Deleted bool `json:"deleted,omitempty"`
 	// Read on the phone up to its last message: false.
 	Unread bool `json:"unread"`
 }
@@ -123,7 +125,7 @@ type Command struct {
 	// For "pair_google": the cookies of a browser signed in to the Google account.
 	Cookies map[string]string `json:"cookies,omitempty"`
 	// For "download": the request, answered by a "downloaded" event of the same id ("done"
-	// for "archive" and "delete_chat", of the conversation below), the
+	// for "archive", "restore" and "delete_chat", of the conversation below), the
 	// message and its media to download.
 	ID      uint64   `json:"id,omitempty"`
 	Message string   `json:"message,omitempty"`
@@ -447,8 +449,8 @@ func (g *gmd) expired(err error) {
 	emit("expired", map[string]any{"message": "the Google session has ended (signed out?)"})
 }
 
-// listConversations says the conversations of the inbox, then those archived or in spam
-// (hidden): "ready", with `since` the time from which every inbox conversation is listed
+// listConversations says the conversations of the inbox, then those archived, in spam or
+// in the trash: "ready", with `since` the time from which every inbox conversation is listed
 // (0: all of them are).
 func (g *gmd) listConversations() {
 	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
@@ -482,6 +484,22 @@ func (g *gmd) listConversations() {
 			continue
 		}
 		convs = append(convs, resp.GetConversations()...)
+	}
+	// The trash has no documented folder: those undocumented, keeping only what is in it.
+	for _, f := range []gmproto.ListConversationsRequest_Folder{3, 4} {
+		resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
+			Count:  conversationCount,
+			Folder: f,
+		})
+		if err != nil {
+			g.logger.Debug().Err(err).Int32("folder", int32(f)).Msg("no trash there")
+			continue
+		}
+		for _, c := range resp.GetConversations() {
+			if c.GetStatus() == gmproto.ConversationStatus_TRASH_FOLDER {
+				convs = append(convs, c)
+			}
+		}
 	}
 	g.lock.Lock()
 	for _, c := range convs {
@@ -551,12 +569,15 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.download(cmd.ID, cmd.Message, cmd.Media)
 		case "fetch":
 			go g.fetch(cmd.Conversations)
-		case "archive", "delete_chat":
+		case "archive", "restore", "delete_chat":
 			go func() {
 				var err error
-				if cmd.Cmd == "archive" {
-					err = g.archive(cmd.Conversation)
-				} else {
+				switch cmd.Cmd {
+				case "archive":
+					err = g.setStatus(cmd.Conversation, gmproto.ConversationStatus_ARCHIVED)
+				case "restore":
+					err = g.setStatus(cmd.Conversation, gmproto.ConversationStatus_ACTIVE)
+				default:
 					err = g.deleteChat(cmd.Conversation)
 				}
 				if err != nil {
@@ -938,7 +959,8 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 			Name:        c.GetName(),
 			Group:       c.GetIsGroupChat(),
 			TimestampMS: c.GetLastMessageTimestamp() / 1000,
-			Hidden:      hidden(c.GetStatus()),
+			Folder:      folder(c.GetStatus()),
+			Deleted:     c.GetStatus() == gmproto.ConversationStatus_DELETED,
 			Unread:      c.GetUnread(),
 		}
 		if latest := c.GetLatestMessage(); latest != nil {
@@ -954,13 +976,14 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 	return list
 }
 
-// archive moves the conversation id out of the inbox of the phone.
-func (g *gmd) archive(id string) error {
+// setStatus moves the conversation id: to the archive (ARCHIVED), back to the inbox
+// (ACTIVE).
+func (g *gmd) setStatus(id string, status gmproto.ConversationStatus) error {
 	resp, err := g.client.UpdateConversation(g.ctx, &gmproto.UpdateConversationRequest{
 		ConversationID: id,
 		Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
 			ConversationID: id,
-			Data:           &gmproto.UpdateConversationData_Status{Status: gmproto.ConversationStatus_ARCHIVED},
+			Data:           &gmproto.UpdateConversationData_Status{Status: status},
 		}},
 	})
 	if err != nil {
@@ -1009,15 +1032,18 @@ func (g *gmd) deleteChat(id string) error {
 	return nil
 }
 
-// hidden says whether a conversation of this status is out of the inbox.
-func hidden(status gmproto.ConversationStatus) bool {
+// folder says where a conversation of this status is filed, out of the inbox; "" for the
+// inbox.
+func folder(status gmproto.ConversationStatus) string {
 	switch status {
-	case gmproto.ConversationStatus_ARCHIVED, gmproto.ConversationStatus_KEEP_ARCHIVED,
-		gmproto.ConversationStatus_DELETED, gmproto.ConversationStatus_SPAM_FOLDER,
-		gmproto.ConversationStatus_BLOCKED_FOLDER, gmproto.ConversationStatus_TRASH_FOLDER:
-		return true
+	case gmproto.ConversationStatus_ARCHIVED, gmproto.ConversationStatus_KEEP_ARCHIVED:
+		return "archive"
+	case gmproto.ConversationStatus_SPAM_FOLDER, gmproto.ConversationStatus_BLOCKED_FOLDER:
+		return "spam"
+	case gmproto.ConversationStatus_TRASH_FOLDER:
+		return "trash"
 	}
-	return false
+	return ""
 }
 
 // loadSession reads the session saved by a previous pairing; nil when there is none.

@@ -80,7 +80,8 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `Ctrl+V` | paste the image in the clipboard |
 | `P` | pin / unpin the selected chat |
 | `a` | archive the selected chat (from the chat list) |
-| `Del` | delete the selected chat and its messages (from the chat list, confirmed) |
+| `Del` | delete the selected chat: to the trash, for good from there (confirmed) |
+| `r` | move the selected chat back to the inbox (from a folder) |
 | `p` | parameters (from the chat list) |
 | `Esc` | unselect, back, give up a stuck send |
 | `q` | quit |
@@ -90,7 +91,8 @@ Sending reactions (`e`) and deleting a message (`Del` in a chat) are not impleme
 ## Good to know
 
 - **History**: at start, the interface opens on the store once connected (or after 10 s, to read offline). Only conversations with new messages are fetched again, their last 30 messages.
-- **Phone sync**: conversations archived, deleted, in spam or blocked on the phone are hidden (back on a new message); renames show at once; reading a chat here marks it read on the phone, and the other way round.
+- **Folders**: *Archive*, *Spam & blocked* and *Trash* show under the chats when not empty; `Enter` opens one, `Esc` goes back.
+- **Phone sync**: conversations archived, trashed, in spam or blocked on the phone move to their folder, those deleted for good go (with their messages here); renames show at once; reading a chat here marks it read on the phone, and the other way round. The trash is listed by the phone only if it allows it: otherwise it holds what was trashed while gmessages-tui ran.
 - **Downloads**: images are fetched when they arrive or when a chat is opened; videos and files wait for `o`. Downloaded media are stored.
 - **Formatting**: RCS and SMS have none; `**bold**` and the like are sent as plain text.
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.

@@ -24,7 +24,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use chat_tui::backend::Result;
-use chat_tui::data::{Attachment, ChatId, Discussion, Message, MessageId};
+use chat_tui::data::{Attachment, ChatId, Discussion, Folder, Message, MessageId};
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use futures::channel::oneshot;
@@ -352,11 +352,15 @@ impl Sync {
         }
     }
 
-    /// A conversation new or changed: stored; the discussion of a new one, with what is
-    /// stored of it.
     /// A conversation new or changed on the phone, as interface events: the discussion (new,
-    /// or its title and visibility for a known one), then whether it was read there.
+    /// or its title, folder and visibility for a known one), then whether it was read there.
+    /// Deleted for good, its messages are forgotten.
     fn conversation(&mut self, conversation: gmd::Conversation) -> Vec<Event> {
+        if conversation.deleted
+            && let Err(e) = self.store.forget(&conversation.id)
+        {
+            pair::say(&format!("Cannot forget the conversation: {e}"));
+        }
         let read = if conversation.unread {
             self.read.remove(&conversation.id);
             None
@@ -378,7 +382,8 @@ impl Sync {
                 id: conversation.id,
                 name: conversation.name,
                 group: conversation.group,
-                hidden: conversation.hidden,
+                hidden: conversation.deleted,
+                folder: conversation.folder,
                 messages,
             })
         };
@@ -404,11 +409,22 @@ impl Sync {
     }
 }
 
+/// The interface folder of a conversation filed in `folder` by the phone.
+fn folder(folder: Option<&str>) -> Option<Folder> {
+    match folder? {
+        "archive" => Some(Folder::Archive),
+        "spam" => Some(Folder::Spam),
+        "trash" => Some(Folder::Trash),
+        _ => None,
+    }
+}
+
 /// The interface discussion of a stored conversation.
 fn stored_discussion(conversation: store::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
     discussion.hidden = conversation.hidden;
+    discussion.folder = folder(conversation.folder.as_deref());
     let messages: Vec<_> = conversation.messages.into_iter().map(message).collect();
     let index: HashMap<MessageId, usize> = messages
         .iter()
@@ -430,7 +446,8 @@ fn stored_discussion(conversation: store::Conversation) -> Discussion {
 fn discussion(conversation: gmd::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
-    discussion.hidden = conversation.hidden;
+    discussion.hidden = conversation.deleted;
+    discussion.folder = folder(conversation.folder.as_deref());
     if let Some(latest) = conversation.latest {
         let sent_ms = conversation.timestamp_ms.max(0) as u64;
         let mut message = Message::mine(latest.id, latest.text, None, false);
@@ -693,7 +710,7 @@ struct GMessages {
 }
 
 impl GMessages {
-    /// Asks gmd to `archive` or `delete_chat` `chat`, until it is done.
+    /// Asks gmd to `archive`, `restore` or `delete_chat` `chat`, until it is done.
     fn chat_action(&self, cmd: &str, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
@@ -728,15 +745,14 @@ impl Backend for GMessages {
         self.chat_action("archive", chat)
     }
 
-    /// On the phone, then its messages and media in the store.
+    /// To the trash of the phone, or for good (its messages then forgotten here, see
+    /// [`Sync::conversation`]).
     fn delete_chat(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        let done = self.chat_action("delete_chat", chat);
-        let (store, chat) = (self.store.clone(), chat.clone());
-        async move {
-            done.await?;
-            store.forget(&chat)?;
-            Ok(())
-        }
+        self.chat_action("delete_chat", chat)
+    }
+
+    fn restore(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
+        self.chat_action("restore", chat)
     }
 
     /// Sent by gmd, then stored with its attachments: as the phone echoed it, with its id.

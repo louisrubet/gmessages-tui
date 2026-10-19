@@ -421,8 +421,8 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chat-tui"
-version = "1.5.0"
-source = "git+https://github.com/louisrubet/chat-tui?tag=v1.5.0#8a74db7f509d2965bbb3a1bbb88a43422ac60302"
+version = "1.6.0"
+source = "git+https://github.com/louisrubet/chat-tui?tag=v1.6.0#3343641a7bdaeb05b36701dc930f721b434cbe55"
 dependencies = [
  "arboard",
  "base64 0.22.1",
