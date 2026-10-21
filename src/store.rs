@@ -183,11 +183,11 @@ impl Store {
     }
 
     /// The conversations missing from those `listed` by the phone although as recent as
-    /// `since`: deleted, or moved since (to the trash, out of it).
+    /// `since`: deleted, or moved since (to the trash, out of it). Not those gone already.
     pub fn unlisted(&self, listed: &[&str], since: i64) -> rusqlite::Result<Vec<String>> {
         let candidates: Vec<String> = self
             .conn
-            .prepare("SELECT id FROM conversations WHERE timestamp_ms >= ?1")?
+            .prepare("SELECT id FROM conversations WHERE NOT hidden AND timestamp_ms >= ?1")?
             .query_map([since], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let gone: Vec<String> = candidates
@@ -248,6 +248,14 @@ impl Store {
             "UPDATE conversations SET hidden = 1, synced = NULL WHERE id = ?1",
             [conversation],
         )?;
+        tx.commit()
+    }
+
+    /// Forgets the message `id` and its media (deleted).
+    pub fn forget_message(&self, id: &str) -> rusqlite::Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM attachments WHERE message = ?1", [id])?;
+        tx.execute("DELETE FROM messages WHERE id = ?1", [id])?;
         tx.commit()
     }
 
@@ -444,8 +452,8 @@ mod tests {
             store.arrived("x", "5").unwrap();
             assert_eq!(store.changed().unwrap(), ["x"]);
             store.fetched("x").unwrap();
-            // Deleted on the phone: not fetched, nor shown. Missing from its lists although
-            // recent, the trash included: to ask about.
+            // Deleted on the phone: not fetched, nor shown, nor asked about. Missing from its
+            // lists although recent, the trash included: to ask about.
             let mut deleted = latest("h", "7");
             deleted.deleted = true;
             store.save_conversations(&[deleted]).unwrap();
@@ -458,7 +466,7 @@ mod tests {
             store.fetched("y").unwrap();
             let mut unlisted = store.unlisted(&["x", "old", "new"], 0).unwrap();
             unlisted.sort();
-            assert_eq!(unlisted, ["h", "t", "y"]);
+            assert_eq!(unlisted, ["t", "y"]);
             assert_eq!(
                 store.unlisted(&["x", "old", "new"], 2).unwrap(),
                 Vec::<String>::new()
@@ -467,6 +475,11 @@ mod tests {
             // Gone: forgotten. Found in the trash after all: fetched again.
             store.forget("y").unwrap();
             assert!(store.conversations_hidden(&["y".to_string()]).unwrap()[0].hidden);
+            assert_eq!(
+                store.unlisted(&["x", "old", "new"], 0).unwrap(),
+                ["t"],
+                "asked once"
+            );
             assert_eq!(store.changed().unwrap(), Vec::<String>::new());
             let mut found = latest("y", "8");
             found.folder = Some("trash".to_string());

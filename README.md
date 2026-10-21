@@ -77,8 +77,11 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
 | `o` | open the links and images of the selected message |
+| `c` | on a message being sent ("Sending…"): cancel it (it may have left already) |
+| `s` | on a message not sent (⚠ Not sent, in red): send it again |
 | `Ctrl+V` | paste the image in the clipboard |
 | `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
+| `n` | new chat (from the chat list): type a name or a number, `Enter` adds the contact selected or the number, `,` adds the number typed; several make a group; `Enter` again starts the chat |
 | `Space` | mark / unmark the selected chat (`Esc` unmarks all) |
 | `P` | pin / unpin the selected chat, or the marked ones |
 | `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
@@ -87,7 +90,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `r` | move the selected or marked chats back to the inbox (from a folder) |
 | `X` | purge the trash: delete all its chats for good (from *Trash*, confirmed) |
 | `p` | parameters (from the chat list) |
-| `Esc` | unselect, back, give up a stuck send |
+| `Esc` | unselect, back (a message being sent goes on) |
 | `q` | quit |
 
 Sending reactions (`e`) and deleting a message (`Del` in a chat) are not implemented yet.

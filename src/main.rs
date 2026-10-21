@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use chat_tui::backend::Result;
 use chat_tui::data::{Attachment, ChatId, Discussion, Folder, Message, MessageId};
+use chat_tui::recipients::Contact;
 use chat_tui::{Backend, Capabilities, Downloaded, Draft, Event};
 use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use futures::channel::oneshot;
@@ -238,11 +239,12 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             Some(gmd::Event::Ready {
                 conversations,
                 since,
+                partial,
             }) => {
                 if let Some(pairing) = pairing.take() {
                     pairing.finish();
                 }
-                break Some((conversations, since));
+                break Some((conversations, since, partial));
             }
             Some(gmd::Event::Status { message }) => pair::say(&message),
             Some(gmd::Event::Fatal { message }) => return Err(message.into()),
@@ -252,6 +254,8 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 | gmd::Event::History { .. }
                 | gmd::Event::Downloaded { .. }
                 | gmd::Event::Done { .. }
+                | gmd::Event::Contacts { .. }
+                | gmd::Event::Started { .. }
                 | gmd::Event::Gone { .. }
                 | gmd::Event::Sent { .. }
                 | gmd::Event::Message { .. }
@@ -261,6 +265,11 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             None => return Err("gmd stopped".into()),
         }
     };
+    // The last message stored: those received after it, fetched, were missed meanwhile.
+    let stopped_ms = stored
+        .iter()
+        .flat_map(|c| c.messages.iter().map(|m| m.timestamp_ms))
+        .max();
     let mut discussions: Vec<Discussion> = stored.into_iter().map(stored_discussion).collect();
     let (lines, commands, control) = gmd.split();
     let mut sync = Sync {
@@ -269,11 +278,14 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         known: discussions.iter().map(|d| d.id.clone()).collect(),
         read: HashSet::new(),
         looked_up: HashSet::new(),
+        fetching: HashSet::new(),
+        stopped_ms,
+        missed: Vec::new(),
     };
     // What changed since last time (hidden, renamed, read on the phone): the first events.
     let mut changes = Vec::new();
-    if let Some((conversations, since)) = ready {
-        for event in sync.ready(conversations, since) {
+    if let Some((conversations, since, partial)) = ready {
+        for event in sync.ready(conversations, since, partial) {
             match event {
                 Event::Chat(discussion) if !discussions.iter().any(|d| d.id == discussion.id) => {
                     discussions.push(discussion)
@@ -305,34 +317,70 @@ struct Sync {
     read: HashSet<ChatId>,
     /// The conversations asked about to the phone, missing from its lists.
     looked_up: HashSet<ChatId>,
+    /// The conversations whose messages are being fetched.
+    fetching: HashSet<ChatId>,
+    /// When the last message stored was sent, on start (`None`: none was).
+    stopped_ms: Option<i64>,
+    /// Messages received after it, fetched: notified once every fetch is done.
+    missed: Vec<(ChatId, MessageId)>,
 }
 
 impl Sync {
     /// The conversations listed by the phone (inbox, then hidden, the inbox complete from
-    /// `since`): stored, the messages of those that changed fetched. Returns them as
-    /// interface events: those not known yet, the others updated, those read on the phone.
-    /// Those missing from the lists are asked about (in the trash, or deleted).
-    fn ready(&mut self, conversations: Vec<gmd::Conversation>, since: i64) -> Vec<Event> {
+    /// `since`; the most recent ones only if `partial`): stored, the messages of those that
+    /// changed fetched. Returns them as interface events: those not known yet, the others
+    /// updated, those read on the phone. Those missing from complete lists are asked about
+    /// (in the trash, or deleted).
+    fn ready(
+        &mut self,
+        conversations: Vec<gmd::Conversation>,
+        since: i64,
+        partial: bool,
+    ) -> Vec<Event> {
         if let Err(e) = self.store.save_conversations(&conversations) {
             pair::say(&format!("Cannot store the conversations: {e}"));
         }
         let listed: Vec<&str> = conversations.iter().map(|c| c.id.as_str()).collect();
-        let unlisted = self.store.unlisted(&listed, since).unwrap_or_default();
+        let unlisted = if partial {
+            Vec::new()
+        } else {
+            self.store.unlisted(&listed, since).unwrap_or_default()
+        };
         if !unlisted.is_empty() {
             self.looked_up.extend(unlisted.iter().cloned());
             self.commands
                 .send(serde_json::json!({"cmd": "lookup", "conversations": unlisted}));
         }
         let changed = self.store.changed().unwrap_or_default();
-        if !changed.is_empty() {
-            self.commands
-                .send(serde_json::json!({"cmd": "fetch", "conversations": changed}));
-        }
+        self.fetch(changed.into_iter().collect());
         let mut events = Vec::new();
         for conversation in conversations {
             events.extend(self.conversation(conversation));
         }
         events
+    }
+
+    /// Fetches the messages of `conversations`, unless being fetched already.
+    fn fetch(&mut self, conversations: Vec<ChatId>) {
+        let conversations: Vec<ChatId> = conversations
+            .into_iter()
+            .filter(|c| self.fetching.insert(c.clone()))
+            .collect();
+        if !conversations.is_empty() {
+            self.commands
+                .send(serde_json::json!({"cmd": "fetch", "conversations": conversations}));
+        }
+    }
+
+    /// The messages of `conversation` fetched, or not (`error`): once every fetch is done,
+    /// those missed, if any.
+    fn fetched(&mut self, conversation: &str, error: Option<String>) -> Option<Event> {
+        self.fetching.remove(conversation);
+        if let Some(error) = error {
+            return Some(Event::Status(format!("Cannot fetch the messages: {error}")));
+        }
+        (self.fetching.is_empty() && !self.missed.is_empty())
+            .then(|| Event::Missed(std::mem::take(&mut self.missed)))
     }
 
     /// A conversation looked up the phone no longer has: forgotten, and hidden.
@@ -353,6 +401,13 @@ impl Sync {
     /// old.
     fn live(&self, conversation: String, m: gmd::Message, old: bool) -> Event {
         let known = matches!(self.store.message(&m.id), Ok(Some(_)));
+        // Deleted, and not known (or forgotten, e.g. not sent and sent again): nothing to show.
+        if m.deleted && !known {
+            return Event::History {
+                chat: conversation,
+                messages: Vec::new(),
+            };
+        }
         let stored = self
             .store
             .save_messages(&conversation, std::slice::from_ref(&m))
@@ -415,12 +470,24 @@ impl Sync {
             .collect()
     }
 
-    /// Messages of `conversation`: stored, then as the interface shows them.
+    /// Messages of `conversation`: stored (those received since the last start, not stored
+    /// yet, missed), then as the interface shows them.
     fn history(
-        &self,
+        &mut self,
         conversation: &str,
         messages: Vec<gmd::Message>,
     ) -> Vec<(Message, Option<MessageId>)> {
+        if let Some(stopped) = self.stopped_ms {
+            let missed = messages.iter().filter(|m| {
+                !m.from_me
+                    && m.timestamp_ms > stopped
+                    && matches!(self.store.message(&m.id), Ok(None))
+            });
+            let missed: Vec<_> = missed
+                .map(|m| (conversation.to_string(), m.id.clone()))
+                .collect();
+            self.missed.extend(missed);
+        }
         if let Err(e) = self
             .store
             .save_messages(conversation, &messages)
@@ -516,6 +583,7 @@ fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
     if m.deleted {
         message.mark_deleted();
     }
+    message.failed = m.failed;
     (message, m.quote.filter(|id| !id.is_empty()))
 }
 
@@ -551,8 +619,9 @@ fn events(
                 gmd::Event::Ready {
                     conversations,
                     since,
+                    partial,
                 } => {
-                    for event in sync.ready(conversations, since) {
+                    for event in sync.ready(conversations, since, partial) {
                         if events.unbounded_send(event).is_err() {
                             return;
                         }
@@ -562,6 +631,38 @@ fn events(
                 gmd::Event::Done { id, error } => {
                     if let Some(done) = waiting.actions.borrow_mut().remove(&id) {
                         let _ = done.send(error.map_or(Ok(()), Err));
+                    }
+                    continue;
+                }
+                gmd::Event::Contacts {
+                    id,
+                    contacts,
+                    error,
+                } => {
+                    if let Some(done) = waiting.contacts.borrow_mut().remove(&id) {
+                        let _ = done.send(match error {
+                            Some(error) => Err(error),
+                            None => Ok(contacts
+                                .into_iter()
+                                .map(|c| Contact {
+                                    name: c.name,
+                                    number: c.number,
+                                })
+                                .collect()),
+                        });
+                    }
+                    continue;
+                }
+                gmd::Event::Started {
+                    id,
+                    conversation,
+                    error,
+                } => {
+                    if let Some(done) = waiting.started.borrow_mut().remove(&id) {
+                        let _ =
+                            done.send(conversation.ok_or_else(|| {
+                                error.unwrap_or_else(|| "no chat started".to_string())
+                            }));
                     }
                     continue;
                 }
@@ -626,9 +727,7 @@ fn events(
                             .changed()
                             .is_ok_and(|c| c.contains(&conversation.id))
                     {
-                        sync.commands.send(
-                            serde_json::json!({"cmd": "fetch", "conversations": [&conversation.id]}),
-                        );
+                        sync.fetch(vec![conversation.id.clone()]);
                     }
                     for event in sync.conversation(conversation) {
                         if events.unbounded_send(event).is_err() {
@@ -650,16 +749,27 @@ fn events(
                 },
                 gmd::Event::History {
                     conversation,
+                    error: Some(error),
+                    ..
+                } => match sync.fetched(&conversation, Some(error)) {
+                    Some(event) => event,
+                    None => continue,
+                },
+                gmd::Event::History {
+                    conversation,
                     messages,
+                    error: None,
                 } => {
                     let read = sync.read.contains(&conversation).then(|| Event::Read {
                         chat: conversation.clone(),
                     });
+                    let messages = sync.history(&conversation, messages);
+                    let missed = sync.fetched(&conversation, None);
                     let history = Event::History {
-                        messages: sync.history(&conversation, messages),
+                        messages,
                         chat: conversation,
                     };
-                    for event in std::iter::once(history).chain(read) {
+                    for event in std::iter::once(history).chain(read).chain(missed) {
                         if events.unbounded_send(event).is_err() {
                             return;
                         }
@@ -699,6 +809,8 @@ struct Waiting {
     downloads: Pending<Vec<Attachment>>,
     sends: Pending<gmd::Message>,
     actions: Pending<()>,
+    contacts: Pending<Vec<Contact>>,
+    started: Pending<gmd::Conversation>,
 }
 
 /// Waits for the answer to request `id` of `pending`, sent if `sent`.
@@ -782,7 +894,82 @@ impl Backend for GMessages {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             chat_actions: true,
+            new_chat: true,
             ..Capabilities::default()
+        }
+    }
+
+    /// Deleted on the phone, then forgotten here.
+    fn discard(
+        &self,
+        _chat: &ChatId,
+        message: &Message,
+    ) -> impl Future<Output = Result<()>> + 'static {
+        let id = self.request();
+        let (done, done_rx) = oneshot::channel();
+        self.waiting.actions.borrow_mut().insert(id, done);
+        let sent = self.commands.send(serde_json::json!({
+            "cmd": "delete_message", "id": id, "message": message.id,
+        }));
+        let (store, actions, message) = (
+            self.store.clone(),
+            self.waiting.actions.clone(),
+            message.id.clone(),
+        );
+        async move {
+            answer(&actions, id, done_rx, sent, ACTION_TIMEOUT).await?;
+            store.forget_message(&message)?;
+            Ok(())
+        }
+    }
+
+    fn contacts(&self) -> impl Future<Output = Result<Vec<Contact>>> + 'static {
+        let id = self.request();
+        let (done, done_rx) = oneshot::channel();
+        self.waiting.contacts.borrow_mut().insert(id, done);
+        let sent = self
+            .commands
+            .send(serde_json::json!({"cmd": "contacts", "id": id}));
+        let contacts = self.waiting.contacts.clone();
+        async move { answer(&contacts, id, done_rx, sent, ACTION_TIMEOUT).await }
+    }
+
+    /// Asked to the phone, then stored; with its messages stored, those since fetched.
+    fn start_chat(
+        &self,
+        numbers: Vec<String>,
+    ) -> impl Future<Output = Result<Discussion>> + 'static {
+        let id = self.request();
+        let (done, done_rx) = oneshot::channel();
+        self.waiting.started.borrow_mut().insert(id, done);
+        let sent = self.commands.send(serde_json::json!({
+            "cmd": "start_chat", "id": id, "numbers": numbers,
+        }));
+        let (store, commands, started) = (
+            self.store.clone(),
+            self.commands.clone(),
+            self.waiting.started.clone(),
+        );
+        async move {
+            let conversation = answer(&started, id, done_rx, sent, ACTION_TIMEOUT).await?;
+            store.save_conversations(std::slice::from_ref(&conversation))?;
+            if store.changed()?.contains(&conversation.id) {
+                commands
+                    .send(serde_json::json!({"cmd": "fetch", "conversations": [&conversation.id]}));
+            }
+            let messages = store.messages(&conversation.id)?;
+            Ok(if messages.is_empty() {
+                discussion(conversation)
+            } else {
+                stored_discussion(store::Conversation {
+                    id: conversation.id,
+                    name: conversation.name,
+                    group: conversation.group,
+                    hidden: conversation.deleted,
+                    folder: conversation.folder,
+                    messages,
+                })
+            })
         }
     }
 

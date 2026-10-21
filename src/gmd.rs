@@ -14,7 +14,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 const GMD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gmd"));
 const GMD_SHA256: &str = env!("GMD_SHA256");
 /// Version of the JSON lines protocol, as gmd says in its `hello`.
-const PROTOCOL: u32 = 9;
+const PROTOCOL: u32 = 10;
 
 /// What gmd reports.
 #[derive(Debug, Deserialize)]
@@ -45,10 +45,13 @@ pub enum Event {
     /// Connected and active: the phone answers now, the conversations follow.
     Connected,
     /// `since`: the time from which every conversation of the inbox is listed (0: all are).
+    /// `partial`: the most recent ones only, all of them follow.
     Ready {
         conversations: Vec<Conversation>,
         #[serde(default)]
         since: i64,
+        #[serde(default)]
+        partial: bool,
     },
     /// The media of a message, for the `download` command of the same `id`.
     Downloaded {
@@ -60,6 +63,19 @@ pub enum Event {
     /// A conversation looked up (`lookup`) the phone no longer has.
     Gone {
         conversation: String,
+    },
+    /// The address book, for the `contacts` command of the same `id`.
+    Contacts {
+        id: u64,
+        #[serde(default)]
+        contacts: Vec<Contact>,
+        error: Option<String>,
+    },
+    /// The conversation started by the `start_chat` command of the same `id`.
+    Started {
+        id: u64,
+        conversation: Option<Conversation>,
+        error: Option<String>,
     },
     /// The `archive` or `delete_chat` command of the same `id` done, or failed.
     Done {
@@ -92,10 +108,12 @@ pub enum Event {
         name: String,
         started: bool,
     },
-    /// The last messages of a conversation.
+    /// The last messages of a conversation, or why they could not be fetched.
     History {
         conversation: String,
+        #[serde(default)]
         messages: Vec<Message>,
+        error: Option<String>,
     },
     Status {
         message: String,
@@ -104,6 +122,13 @@ pub enum Event {
     Fatal {
         message: String,
     },
+}
+
+/// Someone of the address book of the phone, at one of their numbers.
+#[derive(Debug, Deserialize)]
+pub struct Contact {
+    pub name: String,
+    pub number: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,6 +169,9 @@ pub struct Message {
     pub reactions: Vec<Reaction>,
     #[serde(default)]
     pub deleted: bool,
+    /// Ours, not sent: the phone gave up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub failed: bool,
 }
 
 /// A downloaded medium.
