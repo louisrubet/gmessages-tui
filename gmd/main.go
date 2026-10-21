@@ -28,6 +28,7 @@ import (
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/util"
 	"go.mau.fi/util/exhttp"
+	"google.golang.org/protobuf/encoding/protowire"
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
@@ -338,7 +339,9 @@ func (g *gmd) handle(evt any) {
 		}
 		g.live(evt)
 	case *gmproto.Conversation:
-		// New, or changed (name, last message…).
+		// New, or changed (name, last message, folder…).
+		g.logger.Debug().Str("conversation", evt.GetConversationID()).
+			Str("status", evt.GetStatus().String()).Msg("conversation updated")
 		g.lock.Lock()
 		g.convs[evt.GetConversationID()] = evt
 		for _, p := range evt.GetParticipants() {
@@ -597,9 +600,9 @@ func (g *gmd) commands(in io.Reader) error {
 				var err error
 				switch cmd.Cmd {
 				case "archive":
-					err = g.setStatus(cmd.Conversation, gmproto.ConversationStatus_ARCHIVED)
+					err = g.setArchived(cmd.Conversation, true)
 				case "restore":
-					err = g.setStatus(cmd.Conversation, gmproto.ConversationStatus_ACTIVE)
+					err = g.setArchived(cmd.Conversation, false)
 				default:
 					err = g.deleteChat(cmd.Conversation)
 				}
@@ -999,16 +1002,27 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 	return list
 }
 
-// setStatus moves the conversation id: to the archive (ARCHIVED), back to the inbox
-// (ACTIVE).
-func (g *gmd) setStatus(id string, status gmproto.ConversationStatus) error {
-	resp, err := g.client.UpdateConversation(g.ctx, &gmproto.UpdateConversationRequest{
-		ConversationID: id,
-		Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
-			ConversationID: id,
-			Data:           &gmproto.UpdateConversationData_Status{Status: status},
-		}},
-	})
+// Actions of an update of conversation unknown to libgm, as Messages for web sends them.
+const (
+	actionUnarchive gmproto.ConversationActionStatus = 3
+	actionArchive   gmproto.ConversationActionStatus = 4
+)
+
+// setArchived moves the conversation id to the archive, or back to the inbox, as Messages
+// for web does: an action, and the conversation named again in field 6 ({1: id}), unknown
+// to libgm. A new status (ARCHIVED, ACTIVE) in the data is answered success, and ignored.
+func (g *gmd) setArchived(id string, archive bool) error {
+	action := actionUnarchive
+	if archive {
+		action = actionArchive
+	}
+	req := &gmproto.UpdateConversationRequest{Action: action, ConversationID: id}
+	ref := protowire.AppendTag(nil, 1, protowire.BytesType)
+	ref = protowire.AppendString(ref, id)
+	field6 := protowire.AppendTag(nil, 6, protowire.BytesType)
+	field6 = protowire.AppendBytes(field6, ref)
+	req.ProtoReflect().SetUnknown(field6)
+	resp, err := g.client.UpdateConversation(g.ctx, req)
 	if err != nil {
 		return err
 	} else if !resp.GetSuccess() {
