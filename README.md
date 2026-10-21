@@ -81,6 +81,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
 | `Space` | mark / unmark the selected chat, then go to the next one (`Esc` unmarks all) |
 | `P` | pin / unpin the selected chat, or the marked ones |
+| `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
 | `a` | archive the selected or marked chats (from the chat list) |
 | `Del` | delete the selected or marked chats: to the trash, for good from there (confirmed) |
 | `r` | move the selected or marked chats back to the inbox (from a folder) |
