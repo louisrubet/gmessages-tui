@@ -421,8 +421,8 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "chat-tui"
-version = "1.8.0"
-source = "git+https://github.com/louisrubet/chat-tui?tag=v1.8.0#dcebb3cd53999fdc971d5aac5e7da9ee8178af36"
+version = "1.8.1"
+source = "git+https://github.com/louisrubet/chat-tui?tag=v1.8.1#013efb15adae7144b04aaf8df425c17a9aba71c8"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -2461,7 +2461,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.45.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
