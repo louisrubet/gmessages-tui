@@ -56,6 +56,8 @@ type Message struct {
 	Media       []Medium   `json:"media,omitempty"`
 	Reactions   []Reaction `json:"reactions,omitempty"`
 	Deleted     bool       `json:"deleted,omitempty"`
+	// Ours, not sent: the phone gave up.
+	Failed bool `json:"failed,omitempty"`
 }
 
 // Medium is a medium of a message, as the phone describes it: what downloads it. Kept by
@@ -133,8 +135,8 @@ type Command struct {
 	// For "pair_google": the cookies of a browser signed in to the Google account.
 	Cookies map[string]string `json:"cookies,omitempty"`
 	// For "download": the request, answered by a "downloaded" event of the same id ("done"
-	// for "archive", "restore" and "delete_chat", of the conversation below), the
-	// message and its media to download.
+	// for "archive", "restore" and "delete_chat", of the conversation below, and for
+	// "delete_message", of the message), the message and its media to download.
 	ID      uint64   `json:"id,omitempty"`
 	Message string   `json:"message,omitempty"`
 	Media   []Medium `json:"media,omitempty"`
@@ -615,6 +617,20 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.fetch(cmd.Conversations)
 		case "lookup":
 			go g.lookup(cmd.Conversations)
+		case "delete_message":
+			go func() {
+				resp, err := g.client.DeleteMessage(g.ctx, cmd.Message)
+				g.logger.Debug().Err(err).Str("message", cmd.Message).Bool("success", resp.GetSuccess()).
+					Msg("message deleted")
+				switch {
+				case err != nil:
+					emit("done", map[string]any{"id": cmd.ID, "error": err.Error()})
+				case !resp.GetSuccess():
+					emit("done", map[string]any{"id": cmd.ID, "error": "the phone did not delete it"})
+				default:
+					emit("done", map[string]any{"id": cmd.ID})
+				}
+			}()
 		case "contacts":
 			go func() {
 				contacts, err := g.contacts()
@@ -982,6 +998,7 @@ func (g *gmd) message(m *gmproto.Message, names map[string]string) (Message, boo
 		Sender:   names[sender],
 		Quote:    m.GetReplyMessage().GetMessageID(),
 		Deleted:  status == gmproto.MessageStatusType_MESSAGE_DELETED,
+		Failed:   strings.HasPrefix(status.String(), "OUTGOING_FAILED_"),
 	}
 	if p := m.GetSenderParticipant(); msg.Sender == "" && p != nil {
 		msg.Sender = participantName(p)
