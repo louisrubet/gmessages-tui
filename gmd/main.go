@@ -461,8 +461,8 @@ func (g *gmd) expired(err error) {
 }
 
 // listConversations says the conversations of the inbox, then those archived, in spam or
-// in the trash: "ready", with `since` the time from which every inbox conversation is listed
-// (0: all of them are).
+// blocked, in the trash: "ready", with `since` the time from which every inbox
+// conversation is listed (0: all of them are).
 func (g *gmd) listConversations() {
 	start := time.Now()
 	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
@@ -497,21 +497,15 @@ func (g *gmd) listConversations() {
 		}
 		convs = append(convs, resp.GetConversations()...)
 	}
-	// The trash has no documented folder: those undocumented, keeping only what is in it.
-	for _, f := range []gmproto.ListConversationsRequest_Folder{3, 4} {
-		resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
-			Count:  conversationCount,
-			Folder: f,
-		})
-		if err != nil {
-			g.logger.Debug().Err(err).Int32("folder", int32(f)).Msg("no trash there")
-			continue
-		}
-		for _, c := range resp.GetConversations() {
-			if c.GetStatus() == gmproto.ConversationStatus_TRASH_FOLDER {
-				convs = append(convs, c)
-			}
-		}
+	// The trash, a folder unknown to libgm: 8, as from Messages for web.
+	resp, err = g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
+		Count:  conversationCount,
+		Folder: folderTrash,
+	})
+	if err != nil {
+		g.logger.Err(err).Msg("cannot list the trash")
+	} else {
+		convs = append(convs, resp.GetConversations()...)
 	}
 	// The lists take a while: a conversation updated by the phone meanwhile (moved to the
 	// trash…) keeps that update, the lists may predate it.
@@ -1027,6 +1021,9 @@ const (
 	actionArchive   gmproto.ConversationActionStatus = 4
 	actionTrash     gmproto.ConversationActionStatus = 15
 )
+
+// The trash, among the folders listed: unknown to libgm, as Messages for web lists it.
+const folderTrash gmproto.ListConversationsRequest_Folder = 8
 
 // setArchived moves the conversation id to the archive, or back to the inbox, as Messages
 // for web does. A new status (ARCHIVED, ACTIVE) in the data is answered success, and

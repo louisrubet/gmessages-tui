@@ -180,14 +180,11 @@ impl Store {
     }
 
     /// The conversations missing from those `listed` by the phone although as recent as
-    /// `since`: in the trash (not listed), or deleted.
+    /// `since`: deleted, or moved since (to the trash, out of it).
     pub fn unlisted(&self, listed: &[&str], since: i64) -> rusqlite::Result<Vec<String>> {
         let candidates: Vec<String> = self
             .conn
-            .prepare(
-                "SELECT id FROM conversations WHERE timestamp_ms >= ?1
-                 AND folder IS NOT 'trash'",
-            )?
+            .prepare("SELECT id FROM conversations WHERE timestamp_ms >= ?1")?
             .query_map([since], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let gone: Vec<String> = candidates
@@ -439,7 +436,7 @@ mod tests {
             assert_eq!(store.changed().unwrap(), ["x"]);
             store.fetched("x").unwrap();
             // Deleted on the phone: not fetched, nor shown. Missing from its lists although
-            // recent: to ask about, but those in the trash (maybe not listed).
+            // recent, the trash included: to ask about.
             let mut deleted = latest("h", "7");
             deleted.deleted = true;
             store.save_conversations(&[deleted]).unwrap();
@@ -452,7 +449,7 @@ mod tests {
             store.fetched("y").unwrap();
             let mut unlisted = store.unlisted(&["x", "old", "new"], 0).unwrap();
             unlisted.sort();
-            assert_eq!(unlisted, ["h", "y"]);
+            assert_eq!(unlisted, ["h", "t", "y"]);
             assert_eq!(
                 store.unlisted(&["x", "old", "new"], 2).unwrap(),
                 Vec::<String>::new()
