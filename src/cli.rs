@@ -11,7 +11,7 @@ Options:
   --manual       pair from a page in your browser (cookies pasted from Google)
   --qr           pair by QR code, for phones that still offer it
   --uninstall    delete the store key from the keyring, the state and the cache
-  --version      print the release version
+  --version      print the version (with the commit, beyond the release)
   --help         show this help";
 
 #[derive(Debug, PartialEq)]

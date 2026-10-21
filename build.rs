@@ -3,8 +3,12 @@
 //!
 //! `GMD_PATH=/path/to/gmd` uses that file instead (offline builds, or a gmd built from
 //! gmd/ with `go build`); it is not checked.
+//!
+//! Also gives the version: the last release tag (`v1.0.0`), followed by the commit
+//! (`v1.0.0+65028`) when built beyond it; the version of Cargo.toml out of git.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::{env, fs};
 
 use sha2::{Digest, Sha256};
@@ -28,6 +32,38 @@ fn main() {
     let sha = hex(&Sha256::digest(&bytes));
     fs::write(&out, &bytes).expect("cannot write gmd to OUT_DIR");
     println!("cargo:rustc-env=GMD_SHA256={sha}");
+    println!("cargo:rustc-env=GMESSAGES_TUI_VERSION={}", version());
+}
+
+/// The last release tag, `+` the commit when beyond it.
+fn version() -> String {
+    // Built again on a commit or a tag.
+    let branch = git(&["symbolic-ref", "--quiet", "HEAD"]);
+    for path in ["HEAD", "refs/tags", "packed-refs"]
+        .into_iter()
+        .chain(branch.as_deref())
+    {
+        if let Some(path) = git(&["rev-parse", "--git-path", path]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+    let Some(tag) = git(&["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*"]) else {
+        return format!("v{}", env::var("CARGO_PKG_VERSION").unwrap());
+    };
+    match git(&["rev-list", "--count", &format!("{tag}..HEAD")]).as_deref() {
+        Some("0") | None => tag,
+        Some(_) => match git(&["rev-parse", "--short=5", "HEAD"]) {
+            Some(commit) => format!("{tag}+{commit}"),
+            None => tag,
+        },
+    }
+}
+
+/// The output of `git args`, if it succeeds and says something.
+fn git(args: &[&str]) -> Option<String> {
+    let output = Command::new("git").args(args).output().ok()?;
+    let out = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (output.status.success() && !out.is_empty()).then_some(out)
 }
 
 /// The gmd of the target, from the release, checked.

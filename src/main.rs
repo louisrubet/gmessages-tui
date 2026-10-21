@@ -30,6 +30,8 @@ use futures::channel::mpsc::{UnboundedReceiver, unbounded};
 use futures::channel::oneshot;
 
 const NAME: &str = "gmessages-tui";
+/// The last release tag, `+` the commit when built beyond it (see build.rs).
+const VERSION: &str = env!("GMESSAGES_TUI_VERSION");
 
 /// How long the interface waits to be connected before showing what is stored anyway.
 const OFFLINE_AFTER: Duration = Duration::from_secs(10);
@@ -48,7 +50,7 @@ fn main() {
             return;
         }
         Ok(cli::Command::Version) => {
-            println!("v{}", env!("CARGO_PKG_VERSION"));
+            println!("{VERSION}");
             return;
         }
         Ok(cli::Command::Help) => {
@@ -113,7 +115,8 @@ fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
 
 /// `qr`: pair by QR code rather than with the Google account, if pairing.
 async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(), Box<dyn Error>> {
-    let config = chat_tui::Config::new(NAME)?;
+    let mut config = chat_tui::Config::new(NAME)?;
+    config.version = VERSION.to_string();
     let state = config.read_marks.parent().ok_or("no state directory")?;
     create_private_dir(state)?;
     let session = state.join("session.json");
