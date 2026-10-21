@@ -142,6 +142,8 @@ type Command struct {
 	Attachments  []Attachment `json:"attachments,omitempty"`
 	// For "read": the conversation (above) is read up to this message.
 	UpTo string `json:"up_to,omitempty"`
+	// For "delete_chat": for good, from the trash; else to the trash.
+	ForGood bool `json:"for_good,omitempty"`
 }
 
 // Attachment is a downloaded medium.
@@ -200,6 +202,9 @@ type gmd struct {
 	self map[string]bool
 	// The conversations listed, for the names of their participants.
 	convs map[string]*gmproto.Conversation
+	// When each conversation was last updated by the phone: a listing started before
+	// gives an older state of it.
+	updated map[string]time.Time
 	// Messages whose media were asked in full, waiting for their update.
 	waiting map[string]chan *gmproto.Message
 	// The phone's SIMs, by their participant id.
@@ -257,6 +262,7 @@ func run(sessionPath, logPath string) error {
 		sessionPath: sessionPath, logger: logger, ctx: ctx,
 		self:    map[string]bool{"1": true},
 		convs:   map[string]*gmproto.Conversation{},
+		updated: map[string]time.Time{},
 		waiting: map[string]chan *gmproto.Message{},
 		sims:    map[string]*gmproto.SIMCard{},
 		echoes:  map[string]chan *gmproto.Message{},
@@ -344,6 +350,7 @@ func (g *gmd) handle(evt any) {
 			Str("status", evt.GetStatus().String()).Msg("conversation updated")
 		g.lock.Lock()
 		g.convs[evt.GetConversationID()] = evt
+		g.updated[evt.GetConversationID()] = time.Now()
 		for _, p := range evt.GetParticipants() {
 			if p.GetIsMe() && p.GetID().GetParticipantID() != "" {
 				g.self[p.GetID().GetParticipantID()] = true
@@ -457,6 +464,7 @@ func (g *gmd) expired(err error) {
 // in the trash: "ready", with `since` the time from which every inbox conversation is listed
 // (0: all of them are).
 func (g *gmd) listConversations() {
+	start := time.Now()
 	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
 		Count:  conversationCount,
 		Folder: gmproto.ListConversationsRequest_INBOX,
@@ -505,9 +513,18 @@ func (g *gmd) listConversations() {
 			}
 		}
 	}
+	// The lists take a while: a conversation updated by the phone meanwhile (moved to the
+	// trash…) keeps that update, the lists may predate it.
 	g.lock.Lock()
-	for _, c := range convs {
-		g.convs[c.GetConversationID()] = c
+	for i, c := range convs {
+		id := c.GetConversationID()
+		if g.updated[id].After(start) && g.convs[id] != nil {
+			g.logger.Debug().Str("conversation", id).Str("listed", c.GetStatus().String()).
+				Str("kept", g.convs[id].GetStatus().String()).Msg("listing older than an update")
+			convs[i] = g.convs[id]
+			continue
+		}
+		g.convs[id] = c
 		for _, p := range c.GetParticipants() {
 			if p.GetIsMe() && p.GetID().GetParticipantID() != "" {
 				g.self[p.GetID().GetParticipantID()] = true
@@ -523,6 +540,8 @@ func (g *gmd) listConversations() {
 func (g *gmd) lookup(ids []string) {
 	for _, id := range ids {
 		conv, err := g.client.GetConversation(g.ctx, id)
+		g.logger.Debug().Err(err).Str("conversation", id).Str("found", conv.GetConversationID()).
+			Str("status", conv.GetStatus().String()).Msg("conversation looked up")
 		switch {
 		case err != nil:
 			g.logger.Err(err).Str("conversation", id).Msg("cannot look the conversation up")
@@ -604,7 +623,7 @@ func (g *gmd) commands(in io.Reader) error {
 				case "restore":
 					err = g.setArchived(cmd.Conversation, false)
 				default:
-					err = g.deleteChat(cmd.Conversation)
+					err = g.deleteChat(cmd.Conversation, cmd.ForGood)
 				}
 				if err != nil {
 					emit("done", map[string]any{"id": cmd.ID, "error": err.Error()})
@@ -1006,16 +1025,23 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 const (
 	actionUnarchive gmproto.ConversationActionStatus = 3
 	actionArchive   gmproto.ConversationActionStatus = 4
+	actionTrash     gmproto.ConversationActionStatus = 15
 )
 
 // setArchived moves the conversation id to the archive, or back to the inbox, as Messages
-// for web does: an action, and the conversation named again in field 6 ({1: id}), unknown
-// to libgm. A new status (ARCHIVED, ACTIVE) in the data is answered success, and ignored.
+// for web does. A new status (ARCHIVED, ACTIVE) in the data is answered success, and
+// ignored.
 func (g *gmd) setArchived(id string, archive bool) error {
 	action := actionUnarchive
 	if archive {
 		action = actionArchive
 	}
+	return g.act(id, action)
+}
+
+// act does action on the conversation id as Messages for web does: the action, and the
+// conversation named again in field 6 ({1: id}), unknown to libgm.
+func (g *gmd) act(id string, action gmproto.ConversationActionStatus) error {
 	req := &gmproto.UpdateConversationRequest{Action: action, ConversationID: id}
 	ref := protowire.AppendTag(nil, 1, protowire.BytesType)
 	ref = protowire.AppendString(ref, id)
@@ -1031,17 +1057,28 @@ func (g *gmd) setArchived(id string, archive bool) error {
 	return nil
 }
 
-// deleteChat deletes the conversation id and its messages on the phone. The phone wants
-// the number of the other person of a one-to-one conversation.
-func (g *gmd) deleteChat(id string) error {
-	g.lock.Lock()
-	conv := g.convs[id]
-	g.lock.Unlock()
-	if conv == nil {
-		var err error
-		if conv, err = g.client.GetConversation(g.ctx, id); err != nil {
+// deleteChat moves the conversation id to the trash of the phone, as Messages for web does;
+// forGood (asked from the trash only), deletes it and its messages for good. Never for good
+// on the status the phone gives: a conversation shown in the inbox may be in its trash
+// already. For good, the phone wants the number of the other person of
+// a one-to-one conversation.
+func (g *gmd) deleteChat(id string, forGood bool) error {
+	if !forGood {
+		err := g.act(id, actionTrash)
+		if err == nil {
+			return nil
+		}
+		// Refused when in the trash already, though shown elsewhere: shown there again.
+		conv, lookErr := g.client.GetConversation(g.ctx, id)
+		if lookErr != nil || conv.GetStatus() != gmproto.ConversationStatus_TRASH_FOLDER {
 			return err
 		}
+		emit("conversation", map[string]any{"conversation": conversations([]*gmproto.Conversation{conv})[0]})
+		return nil
+	}
+	conv, err := g.client.GetConversation(g.ctx, id)
+	if err != nil {
+		return err
 	}
 	var phone *string
 	if !conv.GetIsGroupChat() {

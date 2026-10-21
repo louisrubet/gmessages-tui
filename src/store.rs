@@ -197,6 +197,19 @@ impl Store {
         Ok(gone)
     }
 
+    /// The folder of the conversation `id` ("archive", "spam", "trash"), as last shown;
+    /// `None` for the inbox, or unknown.
+    pub fn folder(&self, id: &str) -> rusqlite::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT folder FROM conversations WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+    }
+
     /// The conversations `ids`, without their messages.
     pub fn conversations_hidden(&self, ids: &[String]) -> rusqlite::Result<Vec<Conversation>> {
         let mut select = self.conn.prepare(

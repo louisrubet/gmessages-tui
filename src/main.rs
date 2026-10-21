@@ -746,14 +746,20 @@ struct GMessages {
 }
 
 impl GMessages {
-    /// Asks gmd to `archive`, `restore` or `delete_chat` `chat`, until it is done.
-    fn chat_action(&self, cmd: &str, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
+    /// Asks gmd to `archive`, `restore` or `delete_chat` `chat` (`for_good`: from the
+    /// trash), until it is done.
+    fn chat_action(
+        &self,
+        cmd: &str,
+        chat: &ChatId,
+        for_good: bool,
+    ) -> impl Future<Output = Result<()>> + 'static {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
         self.waiting.actions.borrow_mut().insert(id, done);
-        let sent = self
-            .commands
-            .send(serde_json::json!({"cmd": cmd, "id": id, "conversation": chat}));
+        let sent = self.commands.send(serde_json::json!({
+            "cmd": cmd, "id": id, "conversation": chat, "for_good": for_good,
+        }));
         let actions = self.waiting.actions.clone();
         async move { answer(&actions, id, done_rx, sent, ACTION_TIMEOUT).await }
     }
@@ -778,17 +784,19 @@ impl Backend for GMessages {
     }
 
     fn archive(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        self.chat_action("archive", chat)
+        self.chat_action("archive", chat, false)
     }
 
-    /// To the trash of the phone, or for good (its messages then forgotten here, see
-    /// [`Sync::conversation`]).
+    /// To the trash of the phone; for good (its messages then forgotten here, see
+    /// [`Sync::conversation`]) only when shown in the trash, where the interface asks
+    /// "for good?": never on the phone's word alone.
     fn delete_chat(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        self.chat_action("delete_chat", chat)
+        let for_good = matches!(self.store.folder(chat), Ok(Some(folder)) if folder == "trash");
+        self.chat_action("delete_chat", chat, for_good)
     }
 
     fn restore(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        self.chat_action("restore", chat)
+        self.chat_action("restore", chat, false)
     }
 
     /// Sent by gmd, then stored with its attachments: as the phone echoed it, with its id.
