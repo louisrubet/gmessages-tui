@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,7 +33,7 @@ import (
 )
 
 // Version of the protocol spoken on stdin/stdout, checked by gmessages-tui.
-const protocol = 9
+const protocol = 10
 
 // Conversations listed when the session becomes active.
 const conversationCount = 100
@@ -120,6 +121,12 @@ type Latest struct {
 	Sender string `json:"sender"`
 }
 
+// Contact is someone of the address book of the phone, at one of their numbers.
+type Contact struct {
+	Name   string `json:"name"`
+	Number string `json:"number"`
+}
+
 // Command is what gmessages-tui asks.
 type Command struct {
 	Cmd string `json:"cmd"`
@@ -144,6 +151,10 @@ type Command struct {
 	UpTo string `json:"up_to,omitempty"`
 	// For "delete_chat": for good, from the trash; else to the trash.
 	ForGood bool `json:"for_good,omitempty"`
+	// For "start_chat" (answered by a "started" event of the same id): the numbers of the
+	// people to start a chat with, a group for several. "contacts" is answered by a
+	// "contacts" event of the same id.
+	Numbers []string `json:"numbers,omitempty"`
 }
 
 // Attachment is a downloaded medium.
@@ -462,10 +473,14 @@ func (g *gmd) expired(err error) {
 
 // listConversations says the conversations of the inbox, then those archived, in spam or
 // blocked, in the trash: "ready", with `since` the time from which every inbox
-// conversation is listed (0: all of them are).
+// conversation is listed (0: all of them are). The first page of the inbox, the most recent
+// conversations, is said at once ("ready", `partial`) when more follow: those changed
+// meanwhile are fetched without waiting for the rest.
 func (g *gmd) listConversations() {
 	start := time.Now()
-	convs, all, err := g.listFolder(gmproto.ListConversationsRequest_INBOX)
+	convs, all, err := g.listFolder(gmproto.ListConversationsRequest_INBOX, func(page []*gmproto.Conversation) {
+		emit("ready", map[string]any{"conversations": conversations(g.remember(page, start)), "partial": true})
+	})
 	if len(convs) == 0 && err != nil {
 		g.ready.Store(false)
 		emit("status", map[string]any{"message": "cannot list the conversations: " + err.Error()})
@@ -485,12 +500,18 @@ func (g *gmd) listConversations() {
 		gmproto.ListConversationsRequest_SPAM_BLOCKED,
 		folderTrash,
 	} {
-		listed, _, _ := g.listFolder(folder)
+		listed, _, _ := g.listFolder(folder, nil)
 		convs = append(convs, listed...)
 	}
-	// The lists take a while: a conversation updated by the phone meanwhile (moved to the
-	// trash…) keeps that update, the lists may predate it.
+	emit("ready", map[string]any{"conversations": conversations(g.remember(convs, start)), "since": since})
+}
+
+// remember keeps the conversations listed from start, and returns them. The lists take a
+// while: a conversation updated by the phone meanwhile (moved to the trash…) keeps that
+// update, the lists may predate it.
+func (g *gmd) remember(convs []*gmproto.Conversation, start time.Time) []*gmproto.Conversation {
 	g.lock.Lock()
+	defer g.lock.Unlock()
 	for i, c := range convs {
 		id := c.GetConversationID()
 		if g.updated[id].After(start) && g.convs[id] != nil {
@@ -506,8 +527,7 @@ func (g *gmd) listConversations() {
 			}
 		}
 	}
-	g.lock.Unlock()
-	emit("ready", map[string]any{"conversations": conversations(convs), "since": since})
+	return convs
 }
 
 // lookup asks the phone about the conversations ids, missing from its lists (in the trash,
@@ -533,7 +553,7 @@ func (g *gmd) lookup(ids []string) {
 }
 
 // fetch fetches the last messages of the conversations ids, in order, a few at a time: one
-// "history" event each.
+// "history" event each (with the error if it failed).
 func (g *gmd) fetch(ids []string) {
 	queue := make(chan string)
 	var wg sync.WaitGroup
@@ -545,6 +565,7 @@ func (g *gmd) fetch(ids []string) {
 				resp, err := g.client.FetchMessages(g.ctx, id, historyCount, nil)
 				if err != nil {
 					g.logger.Err(err).Str("conversation", id).Msg("cannot fetch the messages")
+					emit("history", map[string]any{"conversation": id, "error": err.Error()})
 					continue
 				}
 				g.lock.Lock()
@@ -594,6 +615,24 @@ func (g *gmd) commands(in io.Reader) error {
 			go g.fetch(cmd.Conversations)
 		case "lookup":
 			go g.lookup(cmd.Conversations)
+		case "contacts":
+			go func() {
+				contacts, err := g.contacts()
+				if err != nil {
+					emit("contacts", map[string]any{"id": cmd.ID, "error": err.Error()})
+				} else {
+					emit("contacts", map[string]any{"id": cmd.ID, "contacts": contacts})
+				}
+			}()
+		case "start_chat":
+			go func() {
+				conv, err := g.startChat(cmd.Numbers)
+				if err != nil {
+					emit("started", map[string]any{"id": cmd.ID, "error": err.Error()})
+				} else {
+					emit("started", map[string]any{"id": cmd.ID, "conversation": conversations([]*gmproto.Conversation{conv})[0]})
+				}
+			}()
 		case "archive", "restore", "delete_chat":
 			go func() {
 				var err error
@@ -1006,9 +1045,10 @@ const folderPages = 50
 
 // listFolder lists every conversation of folder, page by page from the cursor of the
 // previous one: those listed (until an error, or a page bringing nothing new), and whether
-// they are all of them.
+// they are all of them. first, if not nil, gets the first page when more follow.
 func (g *gmd) listFolder(
 	folder gmproto.ListConversationsRequest_Folder,
+	first func([]*gmproto.Conversation),
 ) (convs []*gmproto.Conversation, all bool, err error) {
 	var cursor *gmproto.Cursor
 	seen := map[string]bool{}
@@ -1040,9 +1080,66 @@ func (g *gmd) listFolder(
 			// The cursor ignored: the same page again.
 			return convs, false, nil
 		}
+		if page == 0 && first != nil {
+			first(slices.Clone(convs))
+		}
 		cursor = next
 	}
 	return convs, false, nil
+}
+
+// contacts lists the address book of the phone.
+func (g *gmd) contacts() ([]Contact, error) {
+	resp, err := g.client.ListContacts(g.ctx)
+	if err != nil {
+		return nil, err
+	}
+	contacts := make([]Contact, 0, len(resp.GetContacts()))
+	for _, c := range resp.GetContacts() {
+		number := c.GetNumber().GetNumber()
+		if number == "" {
+			continue
+		}
+		contacts = append(contacts, Contact{Name: c.GetName(), Number: number})
+	}
+	g.logger.Debug().Int("contacts", len(contacts)).Msg("contacts listed")
+	return contacts, nil
+}
+
+// startChat returns the conversation with numbers, created unless it exists already: a
+// group for several numbers, RCS if the phone asks for it, as Messages for web does.
+func (g *gmd) startChat(numbers []string) (*gmproto.Conversation, error) {
+	if len(numbers) == 0 {
+		return nil, errors.New("no number to start a chat with")
+	}
+	req := &gmproto.GetOrCreateConversationRequest{}
+	for _, number := range numbers {
+		req.Numbers = append(req.Numbers, &gmproto.ContactNumber{
+			MysteriousInt: 2,
+			Number:        number,
+			Number2:       number,
+		})
+	}
+	resp, err := g.client.GetOrCreateConversation(g.ctx, req)
+	if err == nil && resp.GetStatus() == gmproto.GetOrCreateConversationResponse_CREATE_RCS {
+		name, create := "", true
+		req.RCSGroupName, req.CreateRCSGroup = &name, &create
+		resp, err = g.client.GetOrCreateConversation(g.ctx, req)
+	}
+	if err != nil {
+		return nil, err
+	}
+	conv := resp.GetConversation()
+	g.logger.Debug().Strs("numbers", numbers).Str("status", resp.GetStatus().String()).
+		Str("conversation", conv.GetConversationID()).Msg("chat started")
+	if conv.GetConversationID() == "" {
+		return nil, fmt.Errorf("the phone gave no conversation (%s)", resp.GetStatus())
+	}
+	g.lock.Lock()
+	g.convs[conv.GetConversationID()] = conv
+	g.updated[conv.GetConversationID()] = time.Now()
+	g.lock.Unlock()
+	return conv, nil
 }
 
 // Actions of an update of conversation unknown to libgm, as Messages for web sends them.
