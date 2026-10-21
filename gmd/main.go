@@ -465,47 +465,28 @@ func (g *gmd) expired(err error) {
 // conversation is listed (0: all of them are).
 func (g *gmd) listConversations() {
 	start := time.Now()
-	resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
-		Count:  conversationCount,
-		Folder: gmproto.ListConversationsRequest_INBOX,
-	})
-	if err != nil {
+	convs, all, err := g.listFolder(gmproto.ListConversationsRequest_INBOX)
+	if len(convs) == 0 && err != nil {
 		g.ready.Store(false)
 		emit("status", map[string]any{"message": "cannot list the conversations: " + err.Error()})
 		return
 	}
-	convs := resp.GetConversations()
 	var since int64
-	if len(convs) >= conversationCount {
+	if !all && len(convs) > 0 {
 		since = convs[0].GetLastMessageTimestamp()
 		for _, c := range convs {
 			since = min(since, c.GetLastMessageTimestamp())
 		}
 		since /= 1000
 	}
+	// The trash, a folder unknown to libgm: 8, as from Messages for web.
 	for _, folder := range []gmproto.ListConversationsRequest_Folder{
 		gmproto.ListConversationsRequest_ARCHIVE,
 		gmproto.ListConversationsRequest_SPAM_BLOCKED,
+		folderTrash,
 	} {
-		resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
-			Count:  conversationCount,
-			Folder: folder,
-		})
-		if err != nil {
-			g.logger.Err(err).Str("folder", folder.String()).Msg("cannot list the conversations")
-			continue
-		}
-		convs = append(convs, resp.GetConversations()...)
-	}
-	// The trash, a folder unknown to libgm: 8, as from Messages for web.
-	resp, err = g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
-		Count:  conversationCount,
-		Folder: folderTrash,
-	})
-	if err != nil {
-		g.logger.Err(err).Msg("cannot list the trash")
-	} else {
-		convs = append(convs, resp.GetConversations()...)
+		listed, _, _ := g.listFolder(folder)
+		convs = append(convs, listed...)
 	}
 	// The lists take a while: a conversation updated by the phone meanwhile (moved to the
 	// trash…) keeps that update, the lists may predate it.
@@ -1018,6 +999,50 @@ func conversations(convs []*gmproto.Conversation) []Conversation {
 		list = append(list, conv)
 	}
 	return list
+}
+
+// Pages of a folder listed at most: folderPages × conversationCount conversations.
+const folderPages = 50
+
+// listFolder lists every conversation of folder, page by page from the cursor of the
+// previous one: those listed (until an error, or a page bringing nothing new), and whether
+// they are all of them.
+func (g *gmd) listFolder(
+	folder gmproto.ListConversationsRequest_Folder,
+) (convs []*gmproto.Conversation, all bool, err error) {
+	var cursor *gmproto.Cursor
+	seen := map[string]bool{}
+	for page := 0; page < folderPages; page++ {
+		resp, err := g.client.ListConversations(g.ctx, &gmproto.ListConversationsRequest{
+			Count:  conversationCount,
+			Folder: folder,
+			Cursor: cursor,
+		})
+		if err != nil {
+			g.logger.Err(err).Str("folder", folder.String()).Msg("cannot list the conversations")
+			return convs, false, err
+		}
+		added := 0
+		for _, c := range resp.GetConversations() {
+			if !seen[c.GetConversationID()] {
+				seen[c.GetConversationID()] = true
+				convs = append(convs, c)
+				added++
+			}
+		}
+		next := resp.GetCursor()
+		g.logger.Debug().Str("folder", folder.String()).Int("page", page).
+			Int("listed", len(resp.GetConversations())).Int("new", added).
+			Str("cursor", next.GetLastItemID()).Msg("folder listed")
+		if len(resp.GetConversations()) < conversationCount || next.GetLastItemID() == "" {
+			return convs, true, nil
+		} else if added == 0 {
+			// The cursor ignored: the same page again.
+			return convs, false, nil
+		}
+		cursor = next
+	}
+	return convs, false, nil
 }
 
 // Actions of an update of conversation unknown to libgm, as Messages for web sends them.
