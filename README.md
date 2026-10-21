@@ -78,7 +78,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `c` | copy the selected message (OSC 52) |
 | `o` | open the links and images of the selected message |
 | `Ctrl+V` | paste the image in the clipboard |
-| `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` opens the one selected, `↓` goes to the results, where `Space`, `P`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
+| `/` | find chats by name and messages by text, ignoring case and accents (from the chat list); `Enter` goes to the results, where `Enter` opens the one selected, `Space`, `P`, `a`, `r`, `Del` act on the chats found and `/` types again; `Esc` goes back |
 | `Space` | mark / unmark the selected chat, then go to the next one (`Esc` unmarks all) |
 | `P` | pin / unpin the selected chat, or the marked ones |
 | `a` | archive the selected or marked chats (from the chat list) |
