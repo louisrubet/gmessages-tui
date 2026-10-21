@@ -168,12 +168,15 @@ impl Store {
     }
 
     /// The conversations whose last message changed since they were last fetched (see
-    /// [`Store::fetched`]), most recent first.
+    /// [`Store::fetched`]), most recent first; those never fetched too, their last message
+    /// unknown (not always said by the phone).
     pub fn changed(&self) -> rusqlite::Result<Vec<String>> {
         self.conn
             .prepare(
-                "SELECT id FROM conversations WHERE latest IS NOT NULL
-                 AND synced IS NOT latest AND NOT hidden ORDER BY timestamp_ms DESC",
+                "SELECT id FROM conversations WHERE NOT hidden
+                 AND (latest IS NOT NULL AND synced IS NOT latest
+                      OR latest IS NULL AND synced IS NULL)
+                 ORDER BY timestamp_ms DESC",
             )?
             .query_map([], |row| row.get(0))?
             .collect()
@@ -248,11 +251,12 @@ impl Store {
         tx.commit()
     }
 
-    /// Records that `conversation` was fetched: up to date with its last message.
+    /// Records that `conversation` was fetched: up to date with its last message ("" when
+    /// unknown).
     pub fn fetched(&self, conversation: &str) -> rusqlite::Result<()> {
         self.conn
             .execute(
-                "UPDATE conversations SET synced = latest WHERE id = ?1",
+                "UPDATE conversations SET synced = coalesce(latest, '') WHERE id = ?1",
                 [conversation],
             )
             .map(|_| ())
@@ -407,6 +411,11 @@ mod tests {
             ]))
             .unwrap();
             store.save_conversations(&conversations).unwrap();
+            // Their last message unknown: fetched once all the same.
+            assert_eq!(store.changed().unwrap(), ["new", "old"], "never fetched");
+            store.fetched("new").unwrap();
+            store.fetched("old").unwrap();
+            assert_eq!(store.changed().unwrap(), Vec::<String>::new());
             let latest = |id: &str, message: &str| -> gmd::Conversation {
                 serde_json::from_value(serde_json::json!({
                     "id": id, "name": id, "group": false, "timestamp_ms": 0,

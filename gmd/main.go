@@ -575,6 +575,11 @@ func (g *gmd) fetch(ids []string) {
 						list = append(list, msg)
 					}
 				}
+				g.lock.Lock()
+				name := g.convs[id].GetName()
+				g.lock.Unlock()
+				g.logger.Debug().Str("conversation", id).Str("name", name).
+					Int("fetched", len(resp.GetMessages())).Int("kept", len(list)).Msg("messages fetched")
 				emit("history", map[string]any{"conversation": id, "messages": list})
 			}
 		}()
