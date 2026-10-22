@@ -1,32 +1,55 @@
 # gmessages-tui
 
-A Google Messages client (RCS and SMS) for the terminal, paired with your Android phone like Google Messages for web. Built on [gmessages-proto](gmessages-proto/), a Rust implementation of the Google Messages for web protocol, and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with [signal-tui](https://github.com/louisrubet/signal-tui).
+**Google Messages (RCS and SMS) in your terminal.** Pair it with your Android phone, the way Google Messages for web does, and read and answer your texts without leaving the terminal.
+
+![gmessages-tui: chat list, a group chat, an emoji shortcode, search, a new chat](doc/demo.gif)
+
+- **Native, not a wrapped web page**: a Rust program speaking the Google Messages for web protocol itself, through [gmessages-proto](gmessages-proto/), a library written for it.
+- **Images in the terminal**: thumbnails inline (kitty graphics protocol), pasted with `Ctrl+V`, opened full size with `o`.
+- **The whole phone**: inbox, archive, spam and trash folders kept in sync both ways; new chats with contacts or numbers, groups; read state, typing, desktop notifications; messages not sent shown as on the phone, with resend.
+- **Keyboard first**: fuzzy `:emoji` picker, search across chats and messages ignoring accents, pinned chats, batch actions.
+- **Offline reading**: history in a local store encrypted with SQLCipher, its key in the OS keyring.
+
+Built on the protocol work of [mautrix-gmessages](https://github.com/mautrix/gmessages) and its library [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm), by Tulir Asokan and the mautrix contributors: they reverse-engineered Google Messages for web, and this project would not exist without them.
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
-- **Images** shown as thumbnails, pasted with `Ctrl+V`, opened full size with `o`
-- **History**: past conversations and their last messages, kept in an encrypted store
-- **Live**: new messages, typing, desktop notifications
-- **Replies, forwards**, reactions shown, fuzzy `:shortcode` emoji picker (fzf style)
-- **Pinned chats**, unread counts
-
-## Install
+## Quick start
 
 Needs Rust ≥ 1.89 and the OpenSSL development package (Fedora: `openssl-devel`, Debian/Ubuntu: `libssl-dev`). On Linux, the sign-in window also needs GTK 3 and WebKitGTK 4.1 (Fedora: `gtk3-devel webkit2gtk4.1-devel`, Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`).
 
 ```sh
 cargo install --locked --git https://github.com/louisrubet/gmessages-tui
+gmessages-tui
 ```
 
-or, from a checkout, `cargo install --locked --path .`. It installs `gmessages-tui` in `~/.cargo/bin` (make sure it is in your `PATH`). Add `--no-default-features` for a headless build without the sign-in window (manual pairing only).
+First run: sign in to the phone's Google account in the window that opens, then tap on your phone the emoji shown in the terminal. That's it: your conversations come in.
 
-## Run
+Add `--no-default-features` to the install for a headless build without the sign-in window (pairing by pasting from a browser, see [options](#pairing-and-options)). From a checkout: `cargo install --locked --path .`.
 
-```sh
-gmessages-tui         # or `cargo run` from a checkout
+## How it works
+
+```
+gmessages-tui  ──HTTPS──▶  Google's relay (as messages.google.com)  ◀──▶  Google Messages on your phone
 ```
 
-First run: sign in to the phone's Google account in the window that opens, then tap the emoji shown in the terminal on your phone. The phone stays the relay: keep it online.
+Google Messages has no public API. Like Google Messages for web, gmessages-tui never talks to the phone directly: both talk to a Google relay. The phone holds the messages and sends them, so **it must stay online**.
+
+- Everything exchanged with the phone is encrypted with keys shared at pairing; media are encrypted per file.
+- No third-party server: gmessages-tui talks only to Google, as the web client does.
+- The protocol is documented in [doc/protocol/](doc/protocol/): a specification written from the analysis of [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm), the Go library of the mautrix-gmessages Matrix bridge, whose authors discovered it.
+- [gmessages-proto](gmessages-proto/) implements it in Rust from that specification alone (a clean-room implementation, without libgm's code). It is a reusable library, AGPL-3.0 like the rest.
+- The interface is [chat-tui](https://github.com/louisrubet/chat-tui), shared with [signal-tui](https://github.com/louisrubet/signal-tui), a Signal client built the same way.
+
+## FAQ
+
+- **iPhone?** No: Google Messages for web, and so gmessages-tui, need Google Messages on an Android phone.
+- **Is it official?** No. It uses the same undocumented API as messages.google.com; Google may change it at any time, and its terms of service apply. Use at your own risk.
+- **Does my phone need to be on?** Yes, and online: it sends and receives everything, as with the web client.
+- **Where do my messages go?** From your phone to your terminal, through Google's relay, as with messages.google.com. Locally, they are kept in an encrypted store (see [Security details](#security-details)).
+- **What is out of scope?** Calls, stickers, and recording voice messages.
+
+## Pairing and options
 
 `gmessages-tui --reset-login` forgets the pairing and starts over. Also remove the old device from your phone (*Device pairing*).
 
@@ -64,6 +87,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `↑` `↓` | select chat / message (in a chat, `↑` starts selecting) |
 | `Enter` | open chat, new message, send |
 | `r` | reply to the selected message |
+| `e` | react to the selected message: `1`–`6` for the usual ones, or type a shortcode |
 | `f` | forward the selected message |
 | `c` | copy the selected message (OSC 52) |
 | `o` | open the links and images of the selected message |
@@ -76,14 +100,13 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 | `P` | pin / unpin the selected chat, or the marked ones |
 | `Shift+↑` `Shift+↓` | move the selected pinned chat up / down among the pinned ones (or `Alt+↑` `Alt+↓`) |
 | `a` | archive the selected or marked chats (from the chat list) |
-| `Del` | delete the selected or marked chats: to the trash, for good from there (confirmed) |
+| `Del` | delete the selected or marked chats: to the trash, for good from there (confirmed); in a chat, the selected message, for you (confirmed) |
 | `r` | move the selected or marked chats back to the inbox (from a folder) |
 | `X` | purge the trash: delete all its chats for good (from *Trash*, confirmed) |
 | `p` | parameters (from the chat list) |
 | `Esc` | unselect, back (a message being sent goes on) |
 | `q` | quit |
 
-Sending reactions (`e`) and deleting a message (`Del` in a chat) are not implemented yet.
 
 ## Good to know
 
@@ -97,7 +120,7 @@ Sending reactions (`e`) and deleting a message (`Del` in a chat) are not impleme
 - **State**: `~/.local/share/gmessages-tui/`. See [Security](#security).
 - **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
 
-## Security
+## Security details
 
 The state holds the session (`session.json`: it gives access to your messages through the phone), the store and the log (`phone.log`).
 
@@ -111,13 +134,9 @@ The state holds the session (`session.json`: it gives access to your messages th
 - **Uninstall**: `gmessages-tui --uninstall` deletes the keyring entry first, then the store and the rest of the state.
 - **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
-## How it works
+## Upgrading from 1.2 and earlier
 
-Google Messages has no public API. gmessages-tui pairs with the phone like Google Messages for web, and speaks the same protocol through [gmessages-proto](gmessages-proto/), a Rust library in this repository.
-
-- **Specification**: the protocol is described in [doc/protocol/](doc/protocol/), written from the analysis of [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) (mautrix-gmessages), whose authors discovered it.
-- **Implementation**: gmessages-proto was written from that specification only, without libgm's code, and is licensed MIT or Apache-2.0.
-- **Sessions** of earlier versions (paired through gmd, the Go helper they embedded) are converted on the first start; the old file is kept as `session.gmd.json`.
+Earlier versions embedded gmd, a Go helper built on libgm. Its session is converted on the first start of 1.3, without pairing again; the old file is kept as `session.gmd.json`.
 
 ## Dev
 
@@ -128,6 +147,12 @@ cargo run --example wry_signin --features wry-signin   # does Google accept the 
 GMESSAGES_TUI_LOG=gmessages_proto=trace cargo run       # log everything to phone.log
 ```
 
+## Credits
+
+- **[mautrix-gmessages](https://github.com/mautrix/gmessages)** and **[libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm)**, by Tulir Asokan and the mautrix contributors (AGPL-3.0): the reverse engineering of Google Messages for web that this project stands on. The protocol specification in [doc/protocol/](doc/protocol/) was written from their work, and gmessages-tui up to 1.2 ran on libgm itself.
+- [UKEY2](https://github.com/google/ukey2) by Google, the key exchange of account pairing.
+- The photos of the demo GIF: Wikimedia Commons, CC BY-SA (authors in [examples/demo/](examples/demo/README.md)).
+
 ## License
 
-gmessages-tui: [AGPL-3.0-only](LICENSE). gmessages-proto: [MIT](gmessages-proto/LICENSE-MIT) or [Apache-2.0](gmessages-proto/LICENSE-APACHE).
+[AGPL-3.0-only](LICENSE), gmessages-tui and gmessages-proto alike.
