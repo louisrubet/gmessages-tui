@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use gmessages_proto as gm;
+pub use gmessages_proto::ReactionOp;
 use serde::{Deserialize, Serialize};
 
 /// What the phone reports.
@@ -67,8 +68,8 @@ pub enum Event {
         conversation: Option<Conversation>,
         error: Option<String>,
     },
-    /// The `Archive`, `Restore`, `DeleteChat` or `DeleteMessage` command of the same `id`
-    /// done, or failed.
+    /// The `Archive`, `Restore`, `DeleteChat`, `DeleteMessage` or `React` command of the same
+    /// `id` done, or failed.
     Done {
         id: u64,
         error: Option<String>,
@@ -160,6 +161,18 @@ pub enum Command {
     DeleteMessage {
         id: u64,
         message: String,
+    },
+    /// Reacts to `message` of `conversation` with `emoji` (adds, replaces ours, or removes it).
+    React {
+        id: u64,
+        conversation: String,
+        message: String,
+        emoji: String,
+        op: gm::ReactionOp,
+    },
+    /// We are typing in `conversation`.
+    Typing {
+        conversation: String,
     },
     Contacts {
         id: u64,
@@ -639,7 +652,10 @@ async fn connect(state: &Rc<State>, session: gm::Session) {
     state.inner.borrow_mut().session = Some(session.clone());
     let (client, events) = match gm::Client::connect(state.config.clone(), session).await {
         Ok(connected) => connected,
-        Err(e) if google && e.is_session_gone() => return expired(state, &e.to_string()),
+        // Signed out, or ended by Google: as an invalid credential, or a bare 401.
+        Err(e) if google && (e.is_session_gone() || e.is_http_status(401)) => {
+            return expired(state, &e.to_string());
+        }
         Err(e) => {
             return state.emit(Event::Fatal {
                 message: format!("cannot connect: {e}"),
@@ -1027,6 +1043,35 @@ async fn run_commands(state: Rc<State>, mut commands: UnboundedReceiver<Command>
                     .await
                     .map_err(|e| e.to_string())
             }),
+            Command::React {
+                id,
+                conversation,
+                message,
+                emoji,
+                op,
+            } => done(state, id, move |s| async move {
+                let client = s.client()?;
+                let sim = s.conversation(&conversation).await?.sim_selector();
+                client
+                    .react(&message, &emoji, op, sim)
+                    .await
+                    .map_err(|e| e.to_string())
+            }),
+            Command::Typing { conversation } => {
+                tokio::task::spawn_local(async move {
+                    let said = async {
+                        let client = state.client()?;
+                        let sim = state.conversation(&conversation).await?.sim_selector();
+                        client
+                            .set_typing(&conversation, sim)
+                            .await
+                            .map_err(|e| e.to_string())
+                    };
+                    if let Err(e) = said.await {
+                        log::warn(&format!("cannot say we are typing: {e}"));
+                    }
+                });
+            }
             Command::Contacts { id } => {
                 tokio::task::spawn_local(async move {
                     let listed = match state.client() {

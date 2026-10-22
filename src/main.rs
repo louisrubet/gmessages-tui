@@ -887,6 +887,8 @@ impl Backend for GMessages {
         Capabilities {
             chat_actions: true,
             new_chat: true,
+            // Deleted on the phone, for us: as Google Messages does.
+            delete_for_me: true,
             ..Capabilities::default()
         }
     }
@@ -1024,22 +1026,45 @@ impl Backend for GMessages {
         }
     }
 
+    /// Said to the phone: added, in place of ours if we had reacted, or removed.
     fn react(
         &self,
-        _chat: &ChatId,
-        _message: &Message,
-        _emoji: &str,
-        _remove: bool,
+        chat: &ChatId,
+        message: &Message,
+        emoji: &str,
+        remove: bool,
     ) -> impl Future<Output = Result<()>> + 'static {
-        async { Err("reactions are not implemented yet".into()) }
+        let op = if remove {
+            phone::ReactionOp::Remove
+        } else if message.reactions.iter().any(|r| r.mine) {
+            phone::ReactionOp::Replace
+        } else {
+            phone::ReactionOp::Add
+        };
+        let (conversation, message, emoji) = (chat.clone(), message.id.clone(), emoji.to_string());
+        self.chat_action(move |id| phone::Command::React {
+            id,
+            conversation,
+            message,
+            emoji,
+            op,
+        })
     }
 
+    /// Deleted on the phone, for us, then forgotten here (as a message discarded).
     fn delete(
         &self,
-        _chat: &ChatId,
-        _message: &Message,
+        chat: &ChatId,
+        message: &Message,
     ) -> impl Future<Output = Result<()>> + 'static {
-        async { Err("deletion is not implemented yet".into()) }
+        self.discard(chat, message)
+    }
+
+    /// Said to the phone, which tells the others.
+    fn typing(&self, chat: &ChatId) {
+        self.commands.send(phone::Command::Typing {
+            conversation: chat.clone(),
+        });
     }
 
     /// Said to the phone, once per last message.
