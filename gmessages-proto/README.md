@@ -63,5 +63,4 @@ The specification this library implements was written by analysing the behaviour
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option. Copyright Louis Rubet.
+[AGPL-3.0-only](LICENSE). Copyright Louis Rubet.
