@@ -14,12 +14,25 @@ Built on the protocol work of [mautrix-gmessages](https://github.com/mautrix/gme
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
+## Install
+
+Packages for Linux x86-64 are attached to each [release](https://github.com/louisrubet/gmessages-tui/releases/latest):
+
+| Distribution | Install |
+|---|---|
+| Ubuntu 24.04 | `sudo apt install ./ubuntu-24.04-gmessages-tui-1.3.0-1.amd64.deb` |
+| Ubuntu 22.04 | `sudo apt install ./ubuntu-22.04-gmessages-tui-1.3.0-1.amd64.deb` |
+| Fedora 44, 43 | `sudo dnf install ./fedora-44-gmessages-tui-1.3.0-1.x86_64.rpm` |
+| Arch Linux | `sudo pacman -U archlinux-latest-gmessages-tui-1.3.0-1-x86_64.pkg.tar.zst` |
+
+Elsewhere, build it with Cargo (below). Packages are made with [multi-distro-packager](https://github.com/louisrubet/multi-distro-packager) from [packaging/](packaging/); [packaging/aur/](packaging/aur/) holds the PKGBUILD for the AUR.
+
 ## Quick start
 
 Needs Rust ≥ 1.89 and the OpenSSL development package (Fedora: `openssl-devel`, Debian/Ubuntu: `libssl-dev`). On Linux, the sign-in window also needs GTK 3 and WebKitGTK 4.1 (Fedora: `gtk3-devel webkit2gtk4.1-devel`, Debian/Ubuntu: `libgtk-3-dev libwebkit2gtk-4.1-dev`).
 
 ```sh
-cargo install --locked --git https://github.com/louisrubet/gmessages-tui
+cargo install --locked --git https://github.com/louisrubet/gmessages-tui   # or a package, above
 gmessages-tui
 ```
 
