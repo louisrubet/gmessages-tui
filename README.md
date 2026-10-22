@@ -1,6 +1,6 @@
 # gmessages-tui
 
-A Google Messages client (RCS and SMS) for the terminal, paired with your Android phone like Google Messages for web. Built on [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with [signal-tui](https://github.com/louisrubet/signal-tui).
+A Google Messages client (RCS and SMS) for the terminal, paired with your Android phone like Google Messages for web. Built on [gmessages-proto](gmessages-proto/), a Rust implementation of the Google Messages for web protocol, and [chat-tui](https://github.com/louisrubet/chat-tui), the interface it shares with [signal-tui](https://github.com/louisrubet/signal-tui).
 
 **Not affiliated with Google.** Google Messages is a trademark of Google LLC.
 
@@ -19,16 +19,6 @@ cargo install --locked --git https://github.com/louisrubet/gmessages-tui
 ```
 
 or, from a checkout, `cargo install --locked --path .`. It installs `gmessages-tui` in `~/.cargo/bin` (make sure it is in your `PATH`). Add `--no-default-features` for a headless build without the sign-in window (manual pairing only).
-
-### Building gmd yourself
-
-The build downloads gmd, already built for Linux, macOS and Windows (x86-64, ARM64). For another platform, or offline, build it with Go (version in [gmd/go.mod](gmd/go.mod)) and point `GMD_PATH` to it:
-
-```sh
-git clone https://github.com/louisrubet/gmessages-tui && cd gmessages-tui
-(cd gmd && CGO_ENABLED=0 go build)
-GMD_PATH=gmd/gmd cargo install --locked --path .
-```
 
 ## Run
 
@@ -109,7 +99,7 @@ Sending reactions (`e`) and deleting a message (`Del` in a chat) are not impleme
 
 ## Security
 
-The state holds the session (`session.json`: it gives access to your messages through the phone), the store and gmd's log.
+The state holds the session (`session.json`: it gives access to your messages through the phone), the store and the log (`phone.log`).
 
 - **Encrypted at rest**: the store (`messages.db`: conversations, messages, media) uses SQLCipher.
 - **The key** is 32 random bytes generated on the first start, kept in the OS keyring: Secret Service on Linux (GNOME Keyring, KWallet), Keychain on macOS, Credential Manager on Windows, under the service `gmessages-tui`.
@@ -123,24 +113,21 @@ The state holds the session (`session.json`: it gives access to your messages th
 
 ## How it works
 
-Google Messages has no public API. Its protocol is spoken by libgm (Go, from mautrix-gmessages), wrapped in **gmd** ([gmd/](gmd/)), a small program speaking JSON lines on stdin/stdout.
+Google Messages has no public API. gmessages-tui pairs with the phone like Google Messages for web, and speaks the same protocol through [gmessages-proto](gmessages-proto/), a Rust library in this repository.
 
-gmd is built ahead for Linux, macOS and Windows (x86-64, ARM64) and published as a [release](https://github.com/louisrubet/gmessages-tui/releases). At build time, `build.rs` downloads the one for the target, checks its SHA-256 against [gmd/release.txt](gmd/release.txt) and embeds it. At run time it is written to `~/.cache/gmessages-tui/` and started. One executable, no Go needed.
-
-- **Offline or other platform**: see [Building gmd yourself](#building-gmd-yourself).
-- **Reproducible**: `gmd/build.sh <tag>` rebuilds every target; the official Go release named in `gmd/go.mod` gives the same hashes.
+- **Specification**: the protocol is described in [doc/protocol/](doc/protocol/), written from the analysis of [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm) (mautrix-gmessages), whose authors discovered it.
+- **Implementation**: gmessages-proto was written from that specification only, without libgm's code, and is licensed MIT or Apache-2.0.
+- **Sessions** of earlier versions (paired through gmd, the Go helper they embedded) are converted on the first start; the old file is kept as `session.gmd.json`.
 
 ## Dev
 
 ```sh
+cargo run                                     # the app
+cargo test --workspace                        # the app and gmessages-proto
 cargo run --example wry_signin --features wry-signin   # does Google accept the webview?
-GMD_PATH=… cargo run                                   # with a local gmd
-cargo test
-gmd/build.sh gmd-vX.Y.Z                                # all targets into gmd/dist/
-git tag gmd-vX.Y.Z && git push origin gmd-vX.Y.Z       # CI builds and publishes them
-gh release download gmd-vX.Y.Z -p release.txt -O gmd/release.txt --clobber   # then commit it
+GMESSAGES_TUI_LOG=gmessages_proto=trace cargo run       # log everything to phone.log
 ```
 
 ## License
 
-[AGPL-3.0-only](LICENSE), like [libgm](https://github.com/mautrix/gmessages) it is built on.
+gmessages-tui: [AGPL-3.0-only](LICENSE). gmessages-proto: [MIT](gmessages-proto/LICENSE-MIT) or [Apache-2.0](gmessages-proto/LICENSE-APACHE).

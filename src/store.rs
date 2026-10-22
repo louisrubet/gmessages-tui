@@ -9,7 +9,7 @@ use std::path::Path;
 use chat_tui::data::Attachment;
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::gmd;
+use crate::phone;
 
 /// Version of the schema, in `PRAGMA user_version`.
 const SCHEMA: i64 = 4;
@@ -30,7 +30,7 @@ pub struct Conversation {
     pub hidden: bool,
     /// Out of the inbox: "archive", "spam", "trash".
     pub folder: Option<String>,
-    pub messages: Vec<gmd::Message>,
+    pub messages: Vec<phone::Message>,
 }
 
 impl Store {
@@ -69,7 +69,7 @@ impl Store {
                     id TEXT PRIMARY KEY,
                     conversation TEXT NOT NULL,
                     sent_ms INTEGER NOT NULL,
-                    -- The message as gmd says it (JSON): media with their keys, reactions.
+                    -- The message as the phone says it (JSON): media with their keys, reactions.
                     data TEXT NOT NULL
                 );
                 CREATE INDEX messages_by_conversation ON messages (conversation, sent_ms);
@@ -141,7 +141,10 @@ impl Store {
     }
 
     /// Records the conversations as the phone lists them.
-    pub fn save_conversations(&self, conversations: &[gmd::Conversation]) -> rusqlite::Result<()> {
+    pub fn save_conversations(
+        &self,
+        conversations: &[phone::Conversation],
+    ) -> rusqlite::Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         {
             let mut save = tx.prepare(
@@ -274,7 +277,7 @@ impl Store {
     pub fn save_messages(
         &self,
         conversation: &str,
-        messages: &[gmd::Message],
+        messages: &[phone::Message],
     ) -> Result<(), Box<dyn Error>> {
         let tx = self.conn.unchecked_transaction()?;
         {
@@ -292,7 +295,7 @@ impl Store {
     }
 
     /// The stored messages of `conversation`, the last ones, in send order.
-    pub fn messages(&self, conversation: &str) -> Result<Vec<gmd::Message>, Box<dyn Error>> {
+    pub fn messages(&self, conversation: &str) -> Result<Vec<phone::Message>, Box<dyn Error>> {
         let mut messages = Vec::new();
         for data in self
             .conn
@@ -320,7 +323,7 @@ impl Store {
     }
 
     /// Message `id`, if stored.
-    pub fn message(&self, id: &str) -> Result<Option<gmd::Message>, Box<dyn Error>> {
+    pub fn message(&self, id: &str) -> Result<Option<phone::Message>, Box<dyn Error>> {
         let data: Option<String> = self
             .conn
             .query_row("SELECT data FROM messages WHERE id = ?1", [id], |row| {
@@ -398,7 +401,7 @@ mod tests {
         ))
     }
 
-    fn message(id: &str, ms: i64) -> gmd::Message {
+    fn message(id: &str, ms: i64) -> phone::Message {
         serde_json::from_value(serde_json::json!({
             "id": id, "timestamp_ms": ms, "from_me": false, "sender_id": "2",
             "sender": "Ann", "text": format!("text of {id}"),
@@ -413,18 +416,19 @@ mod tests {
         let path = temp_path("roundtrip");
         {
             let store = Store::open(&path, "secret").unwrap();
-            let conversations: Vec<gmd::Conversation> = serde_json::from_value(serde_json::json!([
-                {"id": "old", "name": "Old", "group": false, "timestamp_ms": 1},
-                {"id": "new", "name": "New", "group": true, "timestamp_ms": 2},
-            ]))
-            .unwrap();
+            let conversations: Vec<phone::Conversation> =
+                serde_json::from_value(serde_json::json!([
+                    {"id": "old", "name": "Old", "group": false, "timestamp_ms": 1},
+                    {"id": "new", "name": "New", "group": true, "timestamp_ms": 2},
+                ]))
+                .unwrap();
             store.save_conversations(&conversations).unwrap();
             // Their last message unknown: fetched once all the same.
             assert_eq!(store.changed().unwrap(), ["new", "old"], "never fetched");
             store.fetched("new").unwrap();
             store.fetched("old").unwrap();
             assert_eq!(store.changed().unwrap(), Vec::<String>::new());
-            let latest = |id: &str, message: &str| -> gmd::Conversation {
+            let latest = |id: &str, message: &str| -> phone::Conversation {
                 serde_json::from_value(serde_json::json!({
                     "id": id, "name": id, "group": false, "timestamp_ms": 0,
                     "latest": {"id": message, "text": "", "from_me": false, "sender": ""},

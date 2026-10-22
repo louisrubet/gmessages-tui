@@ -6,8 +6,9 @@ license = "AGPL-3.0-only"
 description = "A terminal client for Google Messages (RCS/SMS). Not affiliated with Google."
 repository = "https://github.com/louisrubet/gmessages-tui"
 build = "build.rs"
-# gmd/ is the Go source of the embedded gmd: not part of the crate.
-exclude = ["gmd/*.go", "gmd/go.*", "gmd/dist"]
+
+[workspace]
+members = ["gmessages-proto"]
 
 [dependencies]
 # The interface, shared with signal-tui.
@@ -17,6 +18,8 @@ crossterm = "0.28"
 base64 = "0.22"
 futures = "0.3"
 getrandom = "0.3"
+# Google Messages for web: the protocol.
+gmessages-proto = { path = "gmessages-proto" }
 # The store: SQLCipher (with the system OpenSSL), its key in the OS keyring, a passphrase
 # prompt as a fallback.
 keyring = "4.2"
@@ -27,8 +30,11 @@ serde_json = "1"
 # Native sign-in and the diagnostic example.
 tao = { version = "0.37", optional = true }
 wry = { version = "0.57", optional = true }
-tokio = { version = "1.48", features = ["macros", "rt", "time", "process", "io-util", "net", "signal"] }
+tokio = { version = "1.48", features = ["macros", "rt", "time", "net", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -41,7 +47,3 @@ wry-signin = ["dep:tao", "dep:wry"]
 [[example]]
 name = "wry_signin"
 required-features = ["wry-signin"]
-
-[build-dependencies]
-sha2 = "0.10"
-ureq = "3"

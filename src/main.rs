@@ -6,9 +6,9 @@
 //! Not affiliated with Google.
 
 mod cli;
-mod gmd;
 mod key;
 mod pair;
+mod phone;
 mod session;
 #[cfg(any(feature = "wry-signin", test))]
 mod signin;
@@ -82,15 +82,14 @@ fn main() {
 }
 
 /// Removes what gmessages-tui left on this machine, after confirmation: the store key in the
-/// keyring, the state (session, store, log, marks) and the cached gmd.
+/// keyring and the state (session, store, log, marks); the cached gmd of earlier versions.
 fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
     let config = chat_tui::Config::new(NAME)?;
     let state = config.read_marks.parent().ok_or("no state directory")?;
-    let cache = gmd::cache_dir()?;
+    let cache = cache_dir();
     println!("This deletes, for good:");
     println!("  - the store key in the keyring (service {NAME})");
     println!("  - {} (session, messages, media)", state.display());
-    println!("  - {} (gmd)", cache.display());
     print!("Continue? [y/N] ");
     std::io::Write::flush(&mut std::io::stdout())?;
     let mut answer = String::new();
@@ -101,7 +100,7 @@ fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
     }
     // The key first: without it, a store left behind cannot be read.
     key::forget(&state.join("messages.db"))?;
-    for dir in [state, cache.as_path()] {
+    for dir in std::iter::once(state).chain(cache.as_deref()) {
         match std::fs::remove_dir_all(dir) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(format!("cannot remove {}: {e}", dir.display()).into());
@@ -132,7 +131,9 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         &key::store_key(&store_path)?,
     )?);
     let stored = store.conversations()?;
-    let mut gmd = gmd::Gmd::start(&session, &state.join("gmd.log")).await?;
+    phone::log::init(&state.join("phone.log"));
+    let _ = std::fs::remove_file(state.join("gmd.log"));
+    let mut phone = phone::Phone::start(&session);
     // Paired already: connecting and fetching the conversations take a while.
     if session.exists() {
         pair::say("Syncing\u{2026}");
@@ -157,7 +158,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             _ = tokio::time::sleep_until(offline_after), if may_open => {
                 break None;
             }
-            event = gmd.next() => event?,
+            event = phone.next() => event,
             Some(pasted) = pasted => {
                 let cookies = match pasted {
                     pair::Pasted::Cookies(cookies) => cookies,
@@ -168,34 +169,35 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 if let Some(page) = pairing.as_ref().and_then(pair::Pairing::page) {
                     page.asking();
                 }
-                let command = serde_json::json!({"cmd": "pair_google", "cookies": cookies});
-                gmd.send(command).await?;
+                phone.send(phone::Command::PairGoogle {
+                    cookies: cookies.into_iter().collect(),
+                });
                 continue;
             }
         };
         let page = pairing.as_ref().and_then(pair::Pairing::page);
         match event {
-            Some(gmd::Event::Login) if qr => {
-                gmd.send(serde_json::json!({"cmd": "pair_qr"})).await?;
+            Some(phone::Event::Login) if qr => {
+                phone.send(phone::Command::PairQr);
             }
-            Some(gmd::Event::Login) => {
+            Some(phone::Event::Login) => {
                 let intro = "Pair with the Google account of your phone";
                 drop(pairing.take());
                 pairing = Some(pair::Pairing::start(intro, manual).await?);
             }
-            Some(gmd::Event::Expired { message }) if pairing.is_none() || !manual => {
+            Some(phone::Event::Expired { message }) if pairing.is_none() || !manual => {
                 drop(pairing.take());
                 let intro = format!("Sign in again: {message}. Same Google account");
                 pairing = Some(pair::Pairing::start(&intro, manual).await?);
             }
-            Some(gmd::Event::Expired { message }) => {
+            Some(phone::Event::Expired { message }) => {
                 pair::say(&format!("Sign in again: {message}. Paste again."));
                 page.inspect(|page| page.failed(&message));
             }
-            Some(gmd::Event::PairFailed { message }) if qr => {
+            Some(phone::Event::PairFailed { message }) if qr => {
                 return Err(format!("pairing failed: {message}").into());
             }
-            Some(gmd::Event::PairFailed { message }) if !manual => {
+            Some(phone::Event::PairFailed { message }) if !manual => {
                 drop(pairing.take());
                 pairing = Some(
                     pair::Pairing::start(
@@ -205,38 +207,38 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                     .await?,
                 );
             }
-            Some(gmd::Event::PairFailed { message }) => {
+            Some(phone::Event::PairFailed { message }) => {
                 pair::say(&format!(
                     "Pairing failed: {}. Paste again.",
                     message.trim_end_matches('.')
                 ));
                 page.inspect(|page| page.failed(&message));
             }
-            Some(gmd::Event::Emoji { emoji }) => {
+            Some(phone::Event::Emoji { emoji }) => {
                 pair::say(&format!(
                     "\nOn your phone, Google Messages asks to confirm: tap   {emoji}\n"
                 ));
                 page.inspect(|page| page.emoji(&emoji));
             }
-            Some(gmd::Event::Qr { url }) => {
+            Some(phone::Event::Qr { url }) => {
                 println!(
                     "Scan this QR code from Google Messages on your phone \
                      (Device pairing):"
                 );
                 chat_tui::qr::print_qr(&url);
             }
-            Some(gmd::Event::Paired) => {
+            Some(phone::Event::Paired) => {
                 pair::say("Paired.\nSyncing\u{2026}");
                 page.inspect(|page| page.paired());
             }
             // What is stored is shown at once, the rest follows.
-            Some(gmd::Event::Connected) if !stored.is_empty() => {
+            Some(phone::Event::Connected) if !stored.is_empty() => {
                 if let Some(pairing) = pairing.take() {
                     pairing.finish();
                 }
                 break None;
             }
-            Some(gmd::Event::Ready {
+            Some(phone::Event::Ready {
                 conversations,
                 since,
                 partial,
@@ -246,23 +248,22 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                 }
                 break Some((conversations, since, partial));
             }
-            Some(gmd::Event::Status { message }) => pair::say(&message),
-            Some(gmd::Event::Fatal { message }) => return Err(message.into()),
+            Some(phone::Event::Status { message }) => pair::say(&message),
+            Some(phone::Event::Fatal { message }) => return Err(message.into()),
             Some(
-                gmd::Event::Hello { .. }
-                | gmd::Event::Connected
-                | gmd::Event::History { .. }
-                | gmd::Event::Downloaded { .. }
-                | gmd::Event::Done { .. }
-                | gmd::Event::Contacts { .. }
-                | gmd::Event::Started { .. }
-                | gmd::Event::Gone { .. }
-                | gmd::Event::Sent { .. }
-                | gmd::Event::Message { .. }
-                | gmd::Event::Conversation { .. }
-                | gmd::Event::Typing { .. },
+                phone::Event::Connected
+                | phone::Event::History { .. }
+                | phone::Event::Downloaded { .. }
+                | phone::Event::Done { .. }
+                | phone::Event::Contacts { .. }
+                | phone::Event::Started { .. }
+                | phone::Event::Gone { .. }
+                | phone::Event::Sent { .. }
+                | phone::Event::Message { .. }
+                | phone::Event::Conversation { .. }
+                | phone::Event::Typing { .. },
             ) => {}
-            None => return Err("gmd stopped".into()),
+            None => return Err("the connection to the phone stopped".into()),
         }
     };
     // The last message stored: those received after it, fetched, were missed meanwhile.
@@ -271,7 +272,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
         .flat_map(|c| c.messages.iter().map(|m| m.timestamp_ms))
         .max();
     let mut discussions: Vec<Discussion> = stored.into_iter().map(stored_discussion).collect();
-    let (lines, commands, control) = gmd.split();
+    let (lines, commands, control) = phone.split();
     let mut sync = Sync {
         store: store.clone(),
         commands: commands.clone(),
@@ -310,7 +311,7 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
 /// What keeps the store and the phone in step.
 struct Sync {
     store: Rc<store::Store>,
-    commands: gmd::Commands,
+    commands: phone::Commands,
     /// The conversations the interface has.
     known: HashSet<ChatId>,
     /// The conversations read on the phone: still read once their messages come.
@@ -333,7 +334,7 @@ impl Sync {
     /// (in the trash, or deleted).
     fn ready(
         &mut self,
-        conversations: Vec<gmd::Conversation>,
+        conversations: Vec<phone::Conversation>,
         since: i64,
         partial: bool,
     ) -> Vec<Event> {
@@ -348,8 +349,7 @@ impl Sync {
         };
         if !unlisted.is_empty() {
             self.looked_up.extend(unlisted.iter().cloned());
-            self.commands
-                .send(serde_json::json!({"cmd": "lookup", "conversations": unlisted}));
+            self.commands.send(phone::Command::Lookup(unlisted));
         }
         let changed = self.store.changed().unwrap_or_default();
         self.fetch(changed.into_iter().collect());
@@ -367,8 +367,7 @@ impl Sync {
             .filter(|c| self.fetching.insert(c.clone()))
             .collect();
         if !conversations.is_empty() {
-            self.commands
-                .send(serde_json::json!({"cmd": "fetch", "conversations": conversations}));
+            self.commands.send(phone::Command::Fetch(conversations));
         }
     }
 
@@ -399,7 +398,7 @@ impl Sync {
 
     /// A message arriving live: stored, then shown, as new (notified) unless known already or
     /// old.
-    fn live(&self, conversation: String, m: gmd::Message, old: bool) -> Event {
+    fn live(&self, conversation: String, m: phone::Message, old: bool) -> Event {
         let known = matches!(self.store.message(&m.id), Ok(Some(_)));
         // Deleted, and not known (or forgotten, e.g. not sent and sent again): nothing to show.
         if m.deleted && !known {
@@ -433,7 +432,7 @@ impl Sync {
     /// A conversation new or changed on the phone, as interface events: the discussion (new,
     /// or its title, folder and visibility for a known one), then whether it was read there.
     /// Deleted for good, its messages are forgotten.
-    fn conversation(&mut self, conversation: gmd::Conversation) -> Vec<Event> {
+    fn conversation(&mut self, conversation: phone::Conversation) -> Vec<Event> {
         if conversation.deleted
             && let Err(e) = self.store.forget(&conversation.id)
         {
@@ -475,7 +474,7 @@ impl Sync {
     fn history(
         &mut self,
         conversation: &str,
-        messages: Vec<gmd::Message>,
+        messages: Vec<phone::Message>,
     ) -> Vec<(Message, Option<MessageId>)> {
         if let Some(stopped) = self.stopped_ms {
             let missed = messages.iter().filter(|m| {
@@ -533,7 +532,7 @@ fn stored_discussion(conversation: store::Conversation) -> Discussion {
 
 /// The interface discussion of a conversation, with its latest message until its history
 /// comes.
-fn discussion(conversation: gmd::Conversation) -> Discussion {
+fn discussion(conversation: phone::Conversation) -> Discussion {
     let mut discussion = Discussion::new(conversation.id, conversation.name);
     discussion.is_group = conversation.group;
     discussion.hidden = conversation.deleted;
@@ -556,7 +555,7 @@ fn discussion(conversation: gmd::Conversation) -> Discussion {
 }
 
 /// The interface message of `m`, with the id of the one it quotes.
-fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
+fn message(m: phone::Message) -> (Message, Option<MessageId>) {
     let mut message = Message::mine(m.id, m.text, None, false);
     message.sent_ms = m.timestamp_ms.max(0) as u64;
     if let Some(time) = chrono::DateTime::from_timestamp_millis(m.timestamp_ms) {
@@ -588,23 +587,19 @@ fn message(m: gmd::Message) -> (Message, Option<MessageId>) {
 }
 
 /// The interface attachment of a downloaded medium.
-fn attachment(a: gmd::Attachment) -> std::result::Result<Attachment, String> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&a.data)
-        .map_err(|e| format!("bad medium from gmd: {e}"))?;
-    Ok(Attachment {
+fn attachment(a: phone::Attachment) -> Attachment {
+    Attachment {
         content_type: a.content_type,
         file_name: a.name.filter(|name| !name.is_empty()),
-        bytes,
+        bytes: a.data,
         width: a.width.filter(|&w| w > 0),
         height: a.height.filter(|&h| h > 0),
-    })
+    }
 }
 
-/// What gmd reports while the interface runs, as interface events.
+/// What the phone reports while the interface runs, as interface events.
 fn events(
-    mut lines: tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    mut lines: UnboundedReceiver<phone::Event>,
     mut sync: Sync,
     waiting: Waiting,
     first: Vec<Event>,
@@ -614,9 +609,9 @@ fn events(
         let _ = events.unbounded_send(event);
     }
     tokio::task::spawn_local(async move {
-        while let Ok(Some(event)) = gmd::next_event(&mut lines).await {
+        while let Some(event) = futures::StreamExt::next(&mut lines).await {
             let event = match event {
-                gmd::Event::Ready {
+                phone::Event::Ready {
                     conversations,
                     since,
                     partial,
@@ -628,13 +623,13 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Done { id, error } => {
+                phone::Event::Done { id, error } => {
                     if let Some(done) = waiting.actions.borrow_mut().remove(&id) {
                         let _ = done.send(error.map_or(Ok(()), Err));
                     }
                     continue;
                 }
-                gmd::Event::Contacts {
+                phone::Event::Contacts {
                     id,
                     contacts,
                     error,
@@ -653,7 +648,7 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Started {
+                phone::Event::Started {
                     id,
                     conversation,
                     error,
@@ -666,7 +661,7 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Downloaded {
+                phone::Event::Downloaded {
                     id,
                     attachments,
                     error,
@@ -674,12 +669,12 @@ fn events(
                     if let Some(done) = waiting.downloads.borrow_mut().remove(&id) {
                         let _ = done.send(match error {
                             Some(error) => Err(error),
-                            None => attachments.into_iter().map(attachment).collect(),
+                            None => Ok(attachments.into_iter().map(attachment).collect()),
                         });
                     }
                     continue;
                 }
-                gmd::Event::Sent {
+                phone::Event::Sent {
                     id,
                     conversation,
                     message,
@@ -703,16 +698,16 @@ fn events(
                         (None, ..) => continue,
                     }
                 }
-                gmd::Event::Message {
+                phone::Event::Message {
                     conversation,
                     message,
                     old,
                 } => sync.live(conversation, message, old),
-                gmd::Event::Gone { conversation } => match sync.gone(&conversation) {
+                phone::Event::Gone { conversation } => match sync.gone(&conversation) {
                     Some(event) => event,
                     None => continue,
                 },
-                gmd::Event::Conversation { conversation } => {
+                phone::Event::Conversation { conversation } => {
                     if let Err(e) = sync
                         .store
                         .save_conversations(std::slice::from_ref(&conversation))
@@ -736,7 +731,7 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Typing {
+                phone::Event::Typing {
                     conversation,
                     author,
                     name,
@@ -747,7 +742,7 @@ fn events(
                     name,
                     started,
                 },
-                gmd::Event::History {
+                phone::Event::History {
                     conversation,
                     error: Some(error),
                     ..
@@ -755,7 +750,7 @@ fn events(
                     Some(event) => event,
                     None => continue,
                 },
-                gmd::Event::History {
+                phone::Event::History {
                     conversation,
                     messages,
                     error: None,
@@ -776,11 +771,13 @@ fn events(
                     }
                     continue;
                 }
-                gmd::Event::Status { message } => Event::Status(message),
-                gmd::Event::Expired { message } => Event::Status(format!(
+                phone::Event::Status { message } => Event::Status(message),
+                phone::Event::Expired { message } => Event::Status(format!(
                     "Disconnected: {message}. Restart {NAME} to sign in again"
                 )),
-                gmd::Event::Fatal { message } => Event::Status(format!("Disconnected: {message}")),
+                phone::Event::Fatal { message } => {
+                    Event::Status(format!("Disconnected: {message}"))
+                }
                 _ => continue,
             };
             if events.unbounded_send(event).is_err() {
@@ -800,17 +797,17 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     builder.create(dir)
 }
 
-/// Requests waiting for gmd's answer, by request id.
+/// Requests waiting for the phone's answer, by request id.
 type Pending<T> = Rc<RefCell<HashMap<u64, oneshot::Sender<std::result::Result<T, String>>>>>;
 
-/// What waits for gmd: downloads, messages being sent, conversations archived or deleted.
+/// What waits for the phone: downloads, messages being sent, conversations archived or deleted.
 #[derive(Clone, Default)]
 struct Waiting {
     downloads: Pending<Vec<Attachment>>,
-    sends: Pending<gmd::Message>,
+    sends: Pending<phone::Message>,
     actions: Pending<()>,
     contacts: Pending<Vec<Contact>>,
-    started: Pending<gmd::Conversation>,
+    started: Pending<phone::Conversation>,
 }
 
 /// Waits for the answer to request `id` of `pending`, sent if `sent`.
@@ -837,7 +834,7 @@ async fn answer<T>(
     match answer {
         Ok(Ok(Ok(value))) => Ok(value),
         Ok(Ok(Err(error))) => Err(error.into()),
-        Ok(Err(_)) => Err("gmd has stopped".into()),
+        Ok(Err(_)) => Err("the connection to the phone has stopped".into()),
         Err(_) => Err("no answer from the phone in time".into()),
     }
 }
@@ -852,7 +849,7 @@ const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Google Messages, for the interface: shows the conversations and downloads their media
 /// so far.
 struct GMessages {
-    commands: gmd::Commands,
+    commands: phone::Commands,
     store: Rc<store::Store>,
     waiting: Waiting,
     next_id: Cell<u64>,
@@ -861,20 +858,15 @@ struct GMessages {
 }
 
 impl GMessages {
-    /// Asks gmd to `archive`, `restore` or `delete_chat` `chat` (`for_good`: from the
-    /// trash), until it is done.
+    /// Asks the phone `command` (made with its request id), until it is done.
     fn chat_action(
         &self,
-        cmd: &str,
-        chat: &ChatId,
-        for_good: bool,
+        command: impl FnOnce(u64) -> phone::Command,
     ) -> impl Future<Output = Result<()>> + 'static {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
         self.waiting.actions.borrow_mut().insert(id, done);
-        let sent = self.commands.send(serde_json::json!({
-            "cmd": cmd, "id": id, "conversation": chat, "for_good": for_good,
-        }));
+        let sent = self.commands.send(command(id));
         let actions = self.waiting.actions.clone();
         async move { answer(&actions, id, done_rx, sent, ACTION_TIMEOUT).await }
     }
@@ -908,9 +900,10 @@ impl Backend for GMessages {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
         self.waiting.actions.borrow_mut().insert(id, done);
-        let sent = self.commands.send(serde_json::json!({
-            "cmd": "delete_message", "id": id, "message": message.id,
-        }));
+        let sent = self.commands.send(phone::Command::DeleteMessage {
+            id,
+            message: message.id.clone(),
+        });
         let (store, actions, message) = (
             self.store.clone(),
             self.waiting.actions.clone(),
@@ -927,9 +920,7 @@ impl Backend for GMessages {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
         self.waiting.contacts.borrow_mut().insert(id, done);
-        let sent = self
-            .commands
-            .send(serde_json::json!({"cmd": "contacts", "id": id}));
+        let sent = self.commands.send(phone::Command::Contacts { id });
         let contacts = self.waiting.contacts.clone();
         async move { answer(&contacts, id, done_rx, sent, ACTION_TIMEOUT).await }
     }
@@ -942,9 +933,9 @@ impl Backend for GMessages {
         let id = self.request();
         let (done, done_rx) = oneshot::channel();
         self.waiting.started.borrow_mut().insert(id, done);
-        let sent = self.commands.send(serde_json::json!({
-            "cmd": "start_chat", "id": id, "numbers": numbers,
-        }));
+        let sent = self
+            .commands
+            .send(phone::Command::StartChat { id, numbers });
         let (store, commands, started) = (
             self.store.clone(),
             self.commands.clone(),
@@ -954,8 +945,7 @@ impl Backend for GMessages {
             let conversation = answer(&started, id, done_rx, sent, ACTION_TIMEOUT).await?;
             store.save_conversations(std::slice::from_ref(&conversation))?;
             if store.changed()?.contains(&conversation.id) {
-                commands
-                    .send(serde_json::json!({"cmd": "fetch", "conversations": [&conversation.id]}));
+                commands.send(phone::Command::Fetch(vec![conversation.id.clone()]));
             }
             let messages = store.messages(&conversation.id)?;
             Ok(if messages.is_empty() {
@@ -974,7 +964,8 @@ impl Backend for GMessages {
     }
 
     fn archive(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        self.chat_action("archive", chat, false)
+        let conversation = chat.clone();
+        self.chat_action(|id| phone::Command::Archive { id, conversation })
     }
 
     /// To the trash of the phone; for good (its messages then forgotten here, see
@@ -982,39 +973,43 @@ impl Backend for GMessages {
     /// "for good?": never on the phone's word alone.
     fn delete_chat(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
         let for_good = matches!(self.store.folder(chat), Ok(Some(folder)) if folder == "trash");
-        self.chat_action("delete_chat", chat, for_good)
+        let conversation = chat.clone();
+        self.chat_action(move |id| phone::Command::DeleteChat {
+            id,
+            conversation,
+            for_good,
+        })
     }
 
     fn restore(&self, chat: &ChatId) -> impl Future<Output = Result<()>> + 'static {
-        self.chat_action("restore", chat, false)
+        let conversation = chat.clone();
+        self.chat_action(|id| phone::Command::Restore { id, conversation })
     }
 
-    /// Sent by gmd, then stored with its attachments: as the phone echoed it, with its id.
+    /// Sent to the phone, then stored with its attachments: as the phone echoed it, with its
+    /// id.
     fn send(&self, chat: &ChatId, draft: Draft) -> impl Future<Output = Result<Message>> + 'static {
-        use base64::Engine;
         let id = self.request();
         let (done, sent) = oneshot::channel();
         self.waiting.sends.borrow_mut().insert(id, done);
-        let attachments: Vec<_> = draft
+        let attachments = draft
             .attachments
             .iter()
-            .map(|a| {
-                serde_json::json!({
-                    "content_type": a.content_type,
-                    "name": a.file_name.clone().unwrap_or_default(),
-                    "data": base64::engine::general_purpose::STANDARD.encode(&a.bytes),
-                })
+            .map(|a| phone::Attachment {
+                content_type: a.content_type.clone(),
+                name: a.file_name.clone(),
+                data: a.bytes.clone(),
+                width: a.width,
+                height: a.height,
             })
             .collect();
-        let command = serde_json::json!({
-            "cmd": "send",
-            "id": id,
-            "conversation": chat,
-            "text": draft.text,
-            "reply": draft.reply_to.as_ref().map(|m| &m.id),
-            "attachments": attachments,
+        let ok = self.commands.send(phone::Command::Send {
+            id,
+            conversation: chat.clone(),
+            text: draft.text.clone(),
+            reply: draft.reply_to.as_ref().map(|m| m.id.clone()),
+            attachments,
         });
-        let ok = self.commands.send(command);
         let (store, sends, chat) = (self.store.clone(), self.waiting.sends.clone(), chat.clone());
         async move {
             let sent = answer(&sends, id, sent, ok, SEND_TIMEOUT).await?;
@@ -1053,14 +1048,13 @@ impl Backend for GMessages {
             return;
         }
         self.read.borrow_mut().insert(chat.clone(), last.id.clone());
-        self.commands.send(serde_json::json!({
-            "cmd": "read",
-            "conversation": chat,
-            "up_to": last.id,
-        }));
+        self.commands.send(phone::Command::Read {
+            conversation: chat.clone(),
+            up_to: last.id.clone(),
+        });
     }
 
-    /// From the store if downloaded already; else by gmd, then stored.
+    /// From the store if downloaded already; else from the phone, then stored.
     fn download(
         &self,
         _chat: &ChatId,
@@ -1086,15 +1080,31 @@ impl Backend for GMessages {
             }
             let (done, answer_rx) = oneshot::channel();
             downloads.borrow_mut().insert(id, done);
-            let sent = commands.send(serde_json::json!({
-                "cmd": "download",
-                "id": id,
-                "message": message_id,
-                "media": media,
-            }));
+            let sent = commands.send(phone::Command::Download {
+                id,
+                message: message_id.clone(),
+                media,
+            });
             let attachments = answer(&downloads, id, answer_rx, sent, DOWNLOAD_TIMEOUT).await?;
             store.save_attachments(&message_id, &attachments)?;
             Ok((attachments, Vec::new()))
         }
     }
+}
+
+/// The cache directory where earlier versions kept gmd, if any.
+fn cache_dir() -> Option<std::path::PathBuf> {
+    let var = |name| {
+        std::env::var_os(name)
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+    };
+    let base = if cfg!(windows) {
+        var("LOCALAPPDATA")
+    } else if cfg!(target_os = "macos") {
+        var("HOME").map(|home| home.join("Library/Caches"))
+    } else {
+        var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")))
+    };
+    base.map(|dir| dir.join(NAME))
 }

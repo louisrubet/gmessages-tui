@@ -12,9 +12,10 @@
 //! | [`Fx64`] | `u64` | fixed64 | number |
 //! | [`Bool`] | `bool` | varint | `true`/`false` (decodes numbers too) |
 //! | [`Msg<M>`] | `Option<M>` | nested message | nested array |
-//! | [`B64<M>`] | `Option<M>` | nested message | base64 of the binary form of `M` |
+//! | [`B64Msg<M>`] | `Option<M>` | nested message | base64 of the binary form of `M` |
 //! | [`B64Str`] | `String` | string | base64 of the UTF-8 bytes |
-//! | [`Rep<K>`] | `Vec<K::Value>` | repeated (packed accepted on decode) | array |
+//! | [`Msgs<M>`] | `Vec<M>` | repeated nested message | array of arrays |
+//! | [`Rep<K>`] | `Vec<K::Value>` | repeated scalar (packed accepted on decode) | array |
 //! | [`Opt<K>`] | `Option<K::Value>` | explicit presence | as `K` |
 //!
 //! Unknown fields are skipped on decode in both encodings.
@@ -127,7 +128,8 @@ pub(crate) const B64: base64::engine::GeneralPurpose = base64::engine::general_p
 
 /// Lenient base64 decoding: standard or URL-safe alphabet, padding optional.
 pub fn b64_decode_lenient(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig, alphabet};
+    use base64::alphabet;
+    use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
     const CFG: GeneralPurposeConfig =
         GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent);
     const STD: GeneralPurpose = GeneralPurpose::new(&alphabet::STANDARD, CFG);
@@ -365,8 +367,8 @@ impl<M: Proto> Kind for Msg<M> {
 
 /// A nested message, carried in pblite as base64 of its binary encoding (`b64(M)`).
 #[derive(Debug)]
-pub struct B64<M>(PhantomData<M>);
-impl<M: Proto> Kind for B64<M> {
+pub struct B64Msg<M>(PhantomData<M>);
+impl<M: Proto> Kind for B64Msg<M> {
     type Value = Option<M>;
     const WIRE: WireType = WireType::LengthDelimited;
     fn is_unset(v: &Option<M>) -> bool {
@@ -393,6 +395,42 @@ impl<M: Proto> Kind for B64<M> {
     fn from_json(j: &Json) -> Result<Option<M>, PbLiteError> {
         let raw = b64_decode_lenient(json_str(j)?)?;
         Ok(Some(M::decode(raw.as_slice())?))
+    }
+}
+
+/// Repeated nested message.
+#[derive(Debug)]
+pub struct Msgs<M>(PhantomData<M>);
+impl<M: Proto> Kind for Msgs<M> {
+    type Value = Vec<M>;
+    const WIRE: WireType = WireType::LengthDelimited;
+    const EMPTY_AS_ARRAY: bool = true;
+    fn is_unset(v: &Vec<M>) -> bool {
+        v.is_empty()
+    }
+    fn encode(tag: u32, v: &Vec<M>, buf: &mut impl BufMut) {
+        enc::message::encode_repeated(tag, v, buf)
+    }
+    fn encoded_len(tag: u32, v: &Vec<M>) -> usize {
+        enc::message::encoded_len_repeated(tag, v)
+    }
+    fn merge<B: Buf>(
+        wt: WireType,
+        v: &mut Vec<M>,
+        buf: &mut B,
+        ctx: DecodeContext,
+    ) -> Result<(), DecodeError> {
+        let mut m = M::default();
+        enc::message::merge(wt, &mut m, buf, ctx)?;
+        v.push(m);
+        Ok(())
+    }
+    fn to_json(v: &Vec<M>) -> Json {
+        Json::Array(v.iter().map(PbLite::to_pblite).collect())
+    }
+    fn from_json(j: &Json) -> Result<Vec<M>, PbLiteError> {
+        let arr = j.as_array().ok_or_else(|| PbLiteError::ty("array", j))?;
+        arr.iter().map(M::from_pblite).collect()
     }
 }
 
@@ -617,4 +655,215 @@ macro_rules! message {
             }
         }
     )*};
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire;
+    use serde_json::json;
+
+    crate::message! {
+        /// Test message.
+        pub struct Inner {
+            2 => n: I32,
+        }
+        /// Test message covering every kind.
+        pub struct Sample {
+            1 => s: Str,
+            2 => i: I64,
+            3 => inner: Msg<Inner>,
+            4 => b: Bytes,
+            5 => flag: Bool,
+            6 => list: Rep<Str>,
+            7 => nums: Rep<U64>,
+            8 => msgs: Msgs<Inner>,
+            9 => emb: B64Msg<Inner>,
+            10 => emb_str: B64Str,
+            11 => opt: Opt<I32>,
+            12 => e: Enum,
+            13 => f: Fx64,
+        }
+    }
+
+    #[test]
+    fn spec_example() {
+        // field 1 = "a", field 3 = {2: 5}, highest field 4
+        crate::message! {
+            pub struct Ex { 1 => a: Str, 3 => m: Msg<Inner>, 4 => z: I32 }
+        }
+        let m = Ex {
+            a: "a".into(),
+            m: Some(Inner { n: 5 }),
+            z: 0,
+        };
+        assert_eq!(m.to_pblite(), json!(["a", null, [null, 5], null]));
+        assert_eq!(
+            Ex::from_pblite(&json!(["a", null, [null, 5], null])).unwrap(),
+            m
+        );
+    }
+
+    #[test]
+    fn nulls_and_defaults() {
+        let m = Sample::default();
+        let j = m.to_pblite();
+        let a = j.as_array().unwrap();
+        assert_eq!(a.len(), 13);
+        // repeated fields are [] when empty, everything else null
+        for (i, v) in a.iter().enumerate() {
+            if [5, 6, 7].contains(&i) {
+                assert_eq!(v, &json!([]), "index {i}");
+            } else {
+                assert!(v.is_null(), "index {i}");
+            }
+        }
+        assert_eq!(Sample::from_pblite(&json!(null)).unwrap(), m);
+        assert_eq!(Sample::from_pblite(&json!([])).unwrap(), m);
+        // a present message with all fields unset keeps its full size; one without
+        // fields is []
+        let m = Sample {
+            inner: Some(Inner::default()),
+            ..Default::default()
+        };
+        assert_eq!(m.to_pblite()[2], json!([null, null]));
+        assert_eq!(wire::Empty {}.to_pblite(), json!([]));
+        assert_eq!(Sample::from_pblite(&m.to_pblite()).unwrap(), m);
+    }
+
+    fn full() -> Sample {
+        Sample {
+            s: "héllo".into(),
+            i: -9_007_199_254_740_993,
+            inner: Some(Inner { n: -3 }),
+            b: vec![0, 1, 2, 250],
+            flag: true,
+            list: vec!["x".into(), String::new(), "z".into()],
+            nums: vec![1, u64::MAX],
+            msgs: vec![Inner { n: 1 }, Inner::default()],
+            emb: Some(Inner { n: 7 }),
+            emb_str: "uuid-1".into(),
+            opt: Some(0),
+            e: 42,
+            f: 0xdead_beef_0000_0001,
+        }
+    }
+
+    #[test]
+    fn round_trips() {
+        let m = full();
+        let bin = to_binary(&m);
+        assert_eq!(from_binary::<Sample>(&bin).unwrap(), m);
+        let txt = to_pblite_string(&m);
+        assert_eq!(from_pblite_slice::<Sample>(txt.as_bytes()).unwrap(), m);
+        let j = m.to_pblite();
+        assert_eq!(j[3], json!("AAEC+g=="));
+        // b64(M): base64 of the binary form
+        assert_eq!(j[8], json!(B64.encode(to_binary(&Inner { n: 7 }))));
+        assert_eq!(j[9], json!(B64.encode("uuid-1")));
+        // opt: explicit zero is present
+        assert_eq!(j[10], json!(0));
+        assert_eq!(j[7], json!([[null, 1], [null, null]]));
+    }
+
+    #[test]
+    fn lenient_decoding() {
+        let j = json!([
+            7,                      // number for a string field
+            "-12",                  // i64 as a string
+            [null, "5"],            // i32 as a string
+            "AAEC-g",               // url-safe base64 without padding
+            1,                      // bool as a number
+            ["a", null],            // null element of a repeated string
+            ["18446744073709551615", 3],
+            [[null, 1], null],      // null element of a repeated message
+            null,
+            null,
+            null,
+            "3",
+            "12",
+            "unknown", {"x": 1}     // unknown indices ignored
+        ]);
+        let m = Sample::from_pblite(&j).unwrap();
+        assert_eq!(m.s, "7");
+        assert_eq!(m.i, -12);
+        assert_eq!(m.inner, Some(Inner { n: 5 }));
+        assert_eq!(m.b, vec![0, 1, 2, 250]);
+        assert!(m.flag);
+        assert_eq!(m.list, vec!["a".to_string(), String::new()]);
+        assert_eq!(m.nums, vec![u64::MAX, 3]);
+        assert_eq!(m.msgs, vec![Inner { n: 1 }, Inner::default()]);
+        assert_eq!(m.e, 3);
+        assert_eq!(m.f, 12);
+        // type errors carry the field number
+        let e = Sample::from_pblite(&json!([[1]])).unwrap_err();
+        assert!(e.to_string().contains("field 1"), "{e}");
+    }
+
+    #[test]
+    fn trailing_object_extension() {
+        let j = json!(["a", {"12": 9}]);
+        let m = Sample::from_pblite(&j).unwrap();
+        assert_eq!(m.s, "a");
+        assert_eq!(m.e, 9);
+    }
+
+    #[test]
+    fn unknown_binary_fields_and_packed() {
+        // field 99 (varint), field 100 (bytes), then field 7 packed [1, 300]
+        let mut buf = Vec::new();
+        prost::encoding::encode_key(99, WireType::Varint, &mut buf);
+        prost::encoding::encode_varint(5, &mut buf);
+        prost::encoding::encode_key(100, WireType::LengthDelimited, &mut buf);
+        prost::encoding::encode_varint(2, &mut buf);
+        buf.extend_from_slice(b"hi");
+        prost::encoding::encode_key(7, WireType::LengthDelimited, &mut buf);
+        prost::encoding::encode_varint(3, &mut buf);
+        buf.extend_from_slice(&[1, 0xac, 0x02]);
+        let m: Sample = from_binary(&buf).unwrap();
+        assert_eq!(m.nums, vec![1, 300]);
+    }
+
+    #[test]
+    fn wire_shapes() {
+        // ReceiveMessages field 4 is always [null, []]
+        let r = wire::ReceiveMessagesRequest {
+            credentials: None,
+            unknown4: Some(wire::ReceiveUnknown {
+                empty: Some(wire::Empty {}),
+            }),
+        };
+        assert_eq!(r.to_pblite(), json!([null, null, null, [null, []]]));
+        // QR session destinations: []
+        let s = wire::SendMessageRequest::default();
+        assert_eq!(s.to_pblite()[8], json!([]));
+        assert_eq!(wire::ClientVersion::MAX_FIELD, 9);
+        assert_eq!(wire::PushOptions::MAX_FIELD, 102);
+    }
+
+    #[test]
+    fn stream_item_decoding() {
+        let data = wire::DataPayload {
+            request_id: "r1".into(),
+            action: 16,
+            encrypted: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let payload = B64.encode(to_binary(&data));
+        let txt = format!(
+            r#"[null,["id-9",19,"123",null,2,"456",null,[1,"src","Bugle"],null,null,null,"{payload}"]]"#
+        );
+        let item: wire::StreamItem = from_pblite_slice(txt.as_bytes()).unwrap();
+        let env = item.envelope.unwrap();
+        assert_eq!(env.id, "id-9");
+        assert_eq!(env.route, 19);
+        assert_eq!(env.exec_start, 123);
+        assert_eq!(env.phone.unwrap().source_id, "src");
+        let d: wire::DataPayload = from_binary(&env.payload).unwrap();
+        assert_eq!(d, data);
+        let hb: wire::StreamItem = from_pblite_slice(b"[null,null,[]]").unwrap();
+        assert!(hb.heartbeat.is_some() && hb.envelope.is_none());
+        let bl: wire::StreamItem = from_pblite_slice(b"[null,null,null,[4]]").unwrap();
+        assert_eq!(bl.backlog.unwrap().count, Some(4));
+    }
 }
