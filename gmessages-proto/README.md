@@ -13,7 +13,8 @@ phone running Google Messages through Google's relay, as messages.google.com doe
   (archive, trash, delete, block…), media upload and download (with streaming decryption).
 
 It was implemented **from a written specification** of the protocol
-(`doc/protocol/` in the gmessages-tui repository), without reading the code of other
+([`doc/protocol/`](https://github.com/louisrubet/gmessages-tui/tree/main/doc/protocol) in the
+gmessages-tui repository), without reading the code of other
 implementations. Ambiguities of the specification and the choices made are listed in
 [NOTES.md](NOTES.md).
 
@@ -22,31 +23,36 @@ service apply to its use.
 
 ## Usage
 
+```toml
+[dependencies]
+gmessages-proto = "0.1"
+```
+
 ```rust
 use gmessages_proto::{CancelToken, Client, Config, Event, Folder, pair_with_qr};
 
 async fn demo() -> gmessages_proto::Result<()> {
-let config = Config::with_device_name("my-app");
-let session = pair_with_qr(config.clone(), &CancelToken::new(), |url| {
-    println!("render as a QR code: {url}");
-})
-.await?;
-// persist `session.to_json()`
-let (client, mut events) = Client::connect(config, session).await?;
-let inbox = client.list_conversations(Folder::Inbox, 25, None).await?;
-while let Some(ev) = events.recv().await {
-    match ev {
-        Event::MessageUpserted { message, old } => println!("{} {}", old, message.text()),
-        Event::SessionChanged(s) => { /* persist s */ }
-        Event::LoggedOut(_) => break, // pair again
-        _ => {}
+    let config = Config::with_device_name("my-app");
+    let session = pair_with_qr(config.clone(), &CancelToken::new(), |url| {
+        println!("render as a QR code: {url}");
+    })
+    .await?;
+    // persist `session.to_json()`
+    let (client, mut events) = Client::connect(config, session).await?;
+    let inbox = client.list_conversations(Folder::Inbox, 25, None).await?;
+    while let Some(ev) = events.recv().await {
+        match ev {
+            Event::MessageUpserted { message, old } => println!("{} {}", old, message.text()),
+            Event::SessionChanged(s) => { /* persist s */ }
+            Event::LoggedOut(_) => break, // pair again
+            _ => {}
+        }
     }
-}
-Ok(())
+    Ok(())
 }
 ```
 
-See `examples/qr_pair_and_events.rs`.
+See [`examples/qr_pair_and_events.rs`](https://github.com/louisrubet/gmessages-tui/blob/main/gmessages-proto/examples/qr_pair_and_events.rs).
 
 ## Credits
 

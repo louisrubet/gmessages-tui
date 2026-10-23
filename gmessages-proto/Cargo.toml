@@ -5,9 +5,11 @@ edition = "2024"
 license = "AGPL-3.0-only"
 authors = ["Louis Rubet"]
 description = "Client library for the Google Messages for web protocol, implemented from a written specification"
+repository = "https://github.com/louisrubet/gmessages-tui"
 readme = "README.md"
-keywords = ["google-messages", "sms", "rcs", "client"]
+keywords = ["google-messages", "sms", "rcs", "protocol", "client"]
 categories = ["api-bindings", "network-programming"]
+include = ["/src", "/examples", "/README.md", "/NOTES.md", "/LICENSE"]
 
 [lib]
 name = "gmessages_proto"
