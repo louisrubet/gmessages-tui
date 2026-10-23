@@ -538,9 +538,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "chat-tui"
-version = "1.11.0"
-source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.11.0#de8c0f2ee47fce0735aae8f924b7c34dc2edc08b"
+name = "chat-tui-core"
+version = "1.11.1"
+source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.11.1#8d3c259faf09d54128a2548d40fcef57455f052e"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -588,14 +588,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
 dependencies = [
  "crypto-common 0.2.2",
- "inout 0.2.3",
+ "inout 0.2.5",
 ]
 
 [[package]]
 name = "clipboard-win"
-version = "5.4.1"
+version = "5.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bde03770d3df201d4fb868f2c9c59e66a3e4e2bd06692a0fe701e7103c7e84d4"
+checksum = "052af7878466feccda12ba7a6a67d019d712f296809559b47c12c8cc196d3a9a"
 dependencies = [
  "error-code",
 ]
@@ -1095,8 +1095,8 @@ dependencies = [
 
 [[package]]
 name = "emoji-expander"
-version = "1.2.0"
-source = "git+https://github.com/louisrubet/emoji-expander?tag=v1.2.0#edb9cf2230dd00e4407d188884374b5496dc7047"
+version = "1.2.1"
+source = "git+https://github.com/louisrubet/emoji-expander?tag=v1.2.1#545cb53917ed28b9663ec8014cdbdd49b8f88a84"
 dependencies = [
  "lazy_static",
 ]
@@ -1681,10 +1681,10 @@ dependencies = [
 
 [[package]]
 name = "gmessages-tui"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "base64 0.22.1",
- "chat-tui",
+ "chat-tui-core",
  "chrono",
  "crossterm",
  "futures",
@@ -2181,9 +2181,9 @@ dependencies = [
 
 [[package]]
 name = "inout"
-version = "0.2.3"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8c0d789294fb457b791f7797a04478704788f30b407e5d0b01deaa846572d9f"
+checksum = "3b5cf4372d022092674a83b8febf5865f7a573cc0c5baec5e49c879b6a20978f"
 dependencies = [
  "block-padding",
  "hybrid-array",

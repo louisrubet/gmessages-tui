@@ -1,6 +1,6 @@
 //! Gives the version: the last release tag (`v1.0.0`), followed by the commit
 //! (`v1.0.0+65028`) when built beyond it, and `-dirty` with uncommitted changes; the
-//! version of Cargo.toml out of git.
+//! version of Cargo.toml out of its own repository (from crates.io, say).
 
 use std::env;
 use std::process::Command;
@@ -12,6 +12,9 @@ fn main() {
 /// The last release tag, `+` the commit when beyond it or with uncommitted changes (then
 /// `-dirty`).
 fn version() -> String {
+    if !in_own_repository() {
+        return format!("v{}", env::var("CARGO_PKG_VERSION").unwrap());
+    }
     // Built again on a commit, a tag, or a change to the sources.
     let branch = git(&["symbolic-ref", "--quiet", "HEAD"]);
     for path in ["HEAD", "index", "refs/tags", "packed-refs"]
@@ -34,6 +37,19 @@ fn version() -> String {
         Some(commit) if dirty => format!("{tag}+{commit}-dirty"),
         Some(commit) if beyond => format!("{tag}+{commit}"),
         _ => tag,
+    }
+}
+
+/// Whether the sources are the checkout of the repository itself: not the archive of a
+/// published crate, which may sit inside some other repository.
+fn in_own_repository() -> bool {
+    let Some(top) = git(&["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
+    match (std::fs::canonicalize(top), std::fs::canonicalize(manifest)) {
+        (Ok(top), Ok(manifest)) => top == manifest,
+        _ => false,
     }
 }
 
