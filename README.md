@@ -52,7 +52,7 @@ Google Messages has no public API. Like Google Messages for web, gmessages-tui n
 - No third-party server: gmessages-tui talks only to Google, as the web client does.
 - The protocol is documented in [doc/protocol/](doc/protocol/): a specification written from the analysis of [libgm](https://github.com/mautrix/gmessages/tree/main/pkg/libgm), the Go library of the mautrix-gmessages Matrix bridge, whose authors discovered it.
 - [gmessages-proto](gmessages-proto/) implements it in Rust from that specification alone (a clean-room implementation, without libgm's code). It is a reusable library, AGPL-3.0 like the rest.
-- The interface is [chat-tui](https://github.com/louisrubet/chat-tui), shared with [signal-tui](https://github.com/louisrubet/signal-tui), a Signal client built the same way.
+- The interface is [chat-tui-core](https://github.com/louisrubet/chat-tui-core), shared with [signal-tui](https://github.com/louisrubet/signal-tui), a Signal client built the same way.
 
 ## FAQ
 
@@ -131,7 +131,7 @@ Elsewhere (WezTerm, Konsole, iTerm2, Warp, Windows Terminal, Alacritty, inside t
 - **②** counts the messages received since you last opened a chat; opening it shows a "2 new messages" line above them.
 - **Device name**: the phone lists this client as *gmessages-tui*.
 - **State**: `~/.local/share/gmessages-tui/`. See [Security](#security).
-- **Interface**: [chat-tui](https://github.com/louisrubet/chat-tui), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
+- **Interface**: [chat-tui-core](https://github.com/louisrubet/chat-tui-core), pinned by tag in `Cargo.toml`; its demo with fake chats is `cargo run --example mock_tui` there.
 
 ## Security details
 
