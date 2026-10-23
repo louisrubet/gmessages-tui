@@ -39,12 +39,15 @@ const OFFLINE_AFTER: Duration = Duration::from_secs(10);
 
 fn main() {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    let (qr, manual, reset_login) = match cli::parse(args.iter().map(String::as_str)) {
-        Ok(cli::Command::Run {
-            qr,
-            manual,
-            reset_login,
-        }) => (qr, manual, reset_login),
+    let (qr, manual) = match cli::parse(args.iter().map(String::as_str)) {
+        Ok(cli::Command::Run { qr, manual }) => (qr, manual),
+        Ok(cli::Command::Unpair) => {
+            if let Err(e) = unpair() {
+                eprintln!("{NAME}: {e}");
+                std::process::exit(1);
+            }
+            return;
+        }
         #[cfg(feature = "wry-signin")]
         Ok(cli::Command::Signin) => {
             signin::run_child();
@@ -70,24 +73,59 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("cannot create the Tokio runtime");
     let local = tokio::task::LocalSet::new();
-    if let Err(e) = runtime.block_on(local.run_until(run(qr, manual, reset_login))) {
+    if let Err(e) = runtime().block_on(local.run_until(run(qr, manual))) {
         eprintln!("{NAME}: {e}");
         std::process::exit(1);
     }
 }
 
-/// Removes what gmessages-tui left on this machine, after confirmation: the store key in the
-/// keyring and the state (session, store, log, marks); the cached gmd of earlier versions.
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("cannot create the Tokio runtime")
+}
+
+/// Unpairs the session in `state`, saying what was done: whether the phone was told.
+fn unpair_session(state: &std::path::Path) -> std::result::Result<bool, Box<dyn Error>> {
+    println!("Unpairing\u{2026}");
+    let told = match runtime().block_on(phone::unpair(&state.join("session.json")))? {
+        phone::Unpaired::NotPaired => {
+            println!("Not paired.");
+            true
+        }
+        phone::Unpaired::Revoked => {
+            println!("Unpaired: your phone no longer lists {NAME} (Device pairing).");
+            true
+        }
+        phone::Unpaired::Forgotten(why) => {
+            println!("Unpaired here, but Google could not be told ({why}).");
+            false
+        }
+    };
+    Ok(told)
+}
+
+/// Unpairs: the phone forgets this device, the session is deleted; the store stays.
+fn unpair() -> std::result::Result<(), Box<dyn Error>> {
+    let config = chat_tui::Config::new(NAME)?;
+    let state = config.read_marks.parent().ok_or("no state directory")?;
+    if !unpair_session(state)? {
+        println!("Also remove {NAME} from your phone (Device pairing).");
+    }
+    println!("Run {NAME} to pair again; the messages stored stay.");
+    Ok(())
+}
+
+/// Removes what gmessages-tui left on this machine, after confirmation: the pairing (the phone
+/// told), the store key in the keyring and the state (session, store, log, marks); the cached
+/// gmd of earlier versions.
 fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
     let config = chat_tui::Config::new(NAME)?;
     let state = config.read_marks.parent().ok_or("no state directory")?;
     let cache = cache_dir();
-    println!("This deletes, for good:");
+    println!("This unpairs, then deletes for good:");
     println!("  - the store key in the keyring (service {NAME})");
     println!("  - {} (session, messages, media)", state.display());
     print!("Continue? [y/N] ");
@@ -98,6 +136,7 @@ fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
         println!("Nothing removed.");
         return Ok(());
     }
+    let told = unpair_session(state)?;
     // The key first: without it, a store left behind cannot be read.
     key::forget(&state.join("messages.db"))?;
     for dir in std::iter::once(state).chain(cache.as_deref()) {
@@ -108,22 +147,31 @@ fn uninstall() -> std::result::Result<(), Box<dyn Error>> {
             _ => {}
         }
     }
-    println!("Removed. Also remove gmessages-tui from your phone (Device pairing),");
-    println!("and the program with `cargo uninstall gmessages-tui`.");
+    if told {
+        println!("Removed. Remove the program with `cargo uninstall gmessages-tui`,");
+        println!("or with your package manager.");
+    } else {
+        println!("Removed. Also remove gmessages-tui from your phone (Device pairing),");
+        println!("and the program with `cargo uninstall gmessages-tui`, or your package manager.");
+    }
     Ok(())
 }
 
+/// Starts pairing, in the sign-in window unless `manual`; `manual` then says whether it is
+/// from the browser (also when the window cannot open).
+async fn start_pairing(intro: &str, manual: &mut bool) -> std::io::Result<pair::Pairing> {
+    let pairing = pair::Pairing::start(intro, *manual).await?;
+    *manual = pairing.is_manual();
+    Ok(pairing)
+}
+
 /// `qr`: pair by QR code rather than with the Google account, if pairing.
-async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(), Box<dyn Error>> {
+async fn run(qr: bool, mut manual: bool) -> std::result::Result<(), Box<dyn Error>> {
     let mut config = chat_tui::Config::new(NAME)?;
     config.version = VERSION.to_string();
     let state = config.read_marks.parent().ok_or("no state directory")?;
     create_private_dir(state)?;
     let session = state.join("session.json");
-    if reset_login {
-        session::reset(&session).map_err(|error| format!("cannot reset local login: {error}"))?;
-        pair::say("Local login reset. Starting a new pairing.");
-    }
     // The store first: its passphrase may be asked.
     let store_path = state.join("messages.db");
     let store = Rc::new(store::Store::open(
@@ -164,6 +212,15 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
                     pair::Pasted::Cookies(cookies) => cookies,
                     pair::Pasted::Quit => return Ok(()),
                     pair::Pasted::Failed(error) => return Err(error.into()),
+                    // No window: on from the browser, without restarting.
+                    pair::Pasted::Unavailable(why) => {
+                        pair::say(&format!("{why}: pairing from your browser instead."));
+                        drop(pairing.take());
+                        manual = true;
+                        let intro = "Pair with the Google account of your phone";
+                        pairing = Some(start_pairing(intro, &mut manual).await?);
+                        continue;
+                    }
                 };
                 pair::say("Asking the phone\u{2026}");
                 if let Some(page) = pairing.as_ref().and_then(pair::Pairing::page) {
@@ -183,12 +240,12 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             Some(phone::Event::Login) => {
                 let intro = "Pair with the Google account of your phone";
                 drop(pairing.take());
-                pairing = Some(pair::Pairing::start(intro, manual).await?);
+                pairing = Some(start_pairing(intro, &mut manual).await?);
             }
             Some(phone::Event::Expired { message }) if pairing.is_none() || !manual => {
                 drop(pairing.take());
                 let intro = format!("Sign in again: {message}. Same Google account");
-                pairing = Some(pair::Pairing::start(&intro, manual).await?);
+                pairing = Some(start_pairing(&intro, &mut manual).await?);
             }
             Some(phone::Event::Expired { message }) => {
                 pair::say(&format!("Sign in again: {message}. Paste again."));
@@ -200,9 +257,9 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             Some(phone::Event::PairFailed { message }) if !manual => {
                 drop(pairing.take());
                 pairing = Some(
-                    pair::Pairing::start(
+                    start_pairing(
                         &format!("Pairing failed: {message}. Sign in again"),
-                        manual,
+                        &mut manual,
                     )
                     .await?,
                 );
@@ -222,8 +279,9 @@ async fn run(qr: bool, manual: bool, reset_login: bool) -> std::result::Result<(
             }
             Some(phone::Event::Qr { url }) => {
                 println!(
-                    "Scan this QR code from Google Messages on your phone \
-                     (Device pairing):"
+                    "Scan this QR code with the scanner of Google Messages on your phone \
+                     (Device pairing \u{203a} QR code scanner), not with the camera: the camera \
+                     only opens a Google help page. No scanner there? Use --manual instead."
                 );
                 chat_tui::qr::print_qr(&url);
             }

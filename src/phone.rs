@@ -325,6 +325,8 @@ const ACTIVATE_RETRY: Duration = Duration::from_secs(10);
 
 /// The name of this device on the phone (Device pairing).
 const DEVICE_NAME: &str = "gmessages-tui";
+/// How long Google is given to revoke this device, when unpairing.
+const UNPAIR_WAIT: Duration = Duration::from_secs(20);
 
 /// The phone, running in tasks of the current [`tokio::task::LocalSet`].
 pub struct Phone {
@@ -1521,6 +1523,45 @@ async fn pair_google(
         }
         e => e.to_string(),
     })
+}
+
+/// What unpairing did.
+pub enum Unpaired {
+    /// There was no session.
+    NotPaired,
+    /// Google revoked this device (the phone no longer lists it), and the session is deleted.
+    Revoked,
+    /// The session is deleted, but Google could not be told: why.
+    Forgotten(String),
+}
+
+/// Unpairs the session kept in `path`: Google revokes this device, so that the phone forgets
+/// it, then the session is deleted (also when Google could not be told).
+pub async fn unpair(path: &Path) -> Result<Unpaired, String> {
+    let delete = || {
+        crate::session::reset(path).map_err(|e| format!("cannot delete {}: {e}", path.display()))
+    };
+    let session = match load_session(path) {
+        Ok(Some(session)) => session,
+        Ok(None) => return Ok(Unpaired::NotPaired),
+        // Unreadable: Google cannot be told, but it goes.
+        Err(e) => {
+            delete()?;
+            return Ok(Unpaired::Forgotten(format!("unreadable session: {e}")));
+        }
+    };
+    let revoke = async {
+        let config = gm::Config::with_device_name(DEVICE_NAME);
+        let (client, _events) = gm::Client::connect(config, session).await?;
+        client.unpair().await
+    };
+    let unpaired = match tokio::time::timeout(UNPAIR_WAIT, revoke).await {
+        Ok(Ok(())) => Unpaired::Revoked,
+        Ok(Err(e)) => Unpaired::Forgotten(e.to_string()),
+        Err(_) => Unpaired::Forgotten("Google did not answer".to_string()),
+    };
+    delete()?;
+    Ok(unpaired)
 }
 
 /// The session kept in `path`; `None` when there is none. A session of gmd, the Go helper

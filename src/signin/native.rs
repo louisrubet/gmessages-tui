@@ -22,7 +22,7 @@ impl Native {
         command.arg("--internal-google-signin");
         let native = Self::spawn(&mut command)?;
         pair::say(&format!(
-            "{intro}: sign in in the private Google window.\nThe window hides once sign-in completes; tap the emoji printed here on your phone.\nClose the window before then, or press Ctrl+C in the terminal, to cancel. If Google refuses, restart with --manual or --qr."
+            "{intro}: sign in in the private Google window.\nThe window hides once sign-in completes; tap the emoji printed here on your phone.\nClose the window before then, or press Ctrl+C in the terminal, to cancel. If Google refuses, restart with --manual."
         ));
         Ok(native)
     }
@@ -40,10 +40,10 @@ impl Native {
             for line in io::BufReader::new(stdout).lines() {
                 let pasted = match line {
                     Ok(line) => match line.as_str() {
-                        "refused" => Pasted::Failed("Google refused this embedded browser. Try --manual or --qr.".into()),
+                        "refused" => Pasted::Failed("Google refused this embedded browser. Restart with --manual (or --qr, if your phone offers it).".into()),
                         "closed" => Pasted::Quit,
-                        "missing" => Pasted::Failed("Google Messages loaded, but required authentication cookies are missing. Try --manual or --qr.".into()),
-                        "failed" => Pasted::Failed("Cannot open/read the private Google window. Check your display and WebKitGTK installation, or use --manual.".into()),
+                        "missing" => Pasted::Failed("Google Messages loaded, but required authentication cookies are missing. Restart with --manual (or --qr, if your phone offers it).".into()),
+                        "failed" => Pasted::Unavailable("Cannot open the Google sign-in window".into()),
                         _ => match credentials(&line) {
                             Ok(cookies) => Pasted::Cookies(cookies),
                             Err(error) => Pasted::Failed(error),
@@ -60,9 +60,12 @@ impl Native {
     }
 
     pub async fn next(&mut self) -> Option<Pasted> {
-        Some(self.received.next().await.unwrap_or_else(|| Pasted::Failed(
-            "Google sign-in window stopped unexpectedly. Check your display, or use --manual or --qr.".into()
-        )))
+        Some(
+            self.received
+                .next()
+                .await
+                .unwrap_or_else(|| Pasted::Unavailable("The Google sign-in window stopped".into())),
+        )
     }
 }
 
@@ -242,7 +245,16 @@ mod tests {
         let event = tokio::time::timeout(Duration::from_secs(3), native.next())
             .await
             .unwrap();
-        assert!(matches!(event, Some(Pasted::Failed(_))));
+        assert!(matches!(event, Some(Pasted::Unavailable(_))));
+    }
+
+    #[tokio::test]
+    async fn window_that_cannot_open_is_reported() {
+        let mut native = helper("printf 'failed\\n'");
+        let event = tokio::time::timeout(Duration::from_secs(3), native.next())
+            .await
+            .unwrap();
+        assert!(matches!(event, Some(Pasted::Unavailable(_))));
     }
 
     #[cfg(target_os = "linux")]

@@ -1,5 +1,6 @@
 //! Pairing before the interface: native Google sign-in by default, or manual
-//! cookie import in the terminal or the local pairing page (see [`web`]).
+//! cookie import in the terminal or the local pairing page (see [`web`]), also when the
+//! sign-in window cannot open (no display, in a container or over SSH).
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -36,9 +37,13 @@ pub enum Pasted {
     Cookies(Cookies),
     Quit,
     Failed(String),
+    /// The sign-in window could not open, or stopped: why. Pairing goes on from the browser.
+    #[cfg_attr(not(feature = "wry-signin"), allow(dead_code))]
+    Unavailable(String),
 }
 
-/// Selects native sign-in by default, with an explicit manual/headless fallback.
+/// Selects native sign-in by default, with a manual fallback: asked for (`--manual`), or when
+/// the window cannot open.
 pub enum Pairing {
     Manual(ManualPairing),
     #[cfg(feature = "wry-signin")]
@@ -49,11 +54,25 @@ impl Pairing {
     pub async fn start(intro: &str, manual: bool) -> io::Result<Self> {
         #[cfg(feature = "wry-signin")]
         if !manual {
-            return crate::signin::Native::start(intro).map(Self::Native);
+            if !has_display() {
+                say("No display for the sign-in window: pairing from your browser instead.");
+            } else {
+                match crate::signin::Native::start(intro) {
+                    Ok(native) => return Ok(Self::Native(native)),
+                    Err(e) => say(&format!(
+                        "Cannot open the sign-in window ({e}): pairing from your browser instead."
+                    )),
+                }
+            }
         }
         #[cfg(not(feature = "wry-signin"))]
         let _ = manual;
         ManualPairing::start(intro).await.map(Self::Manual)
+    }
+
+    /// Whether pairing is from the browser (cookies pasted), not in the sign-in window.
+    pub fn is_manual(&self) -> bool {
+        matches!(self, Self::Manual(_))
     }
 
     pub async fn next(&mut self) -> Option<Pasted> {
@@ -275,6 +294,17 @@ fn pairs(header: &str) -> Cookies {
         .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
         .filter(|(name, _)| !name.is_empty())
         .collect()
+}
+
+/// Whether a window can open: on Linux and the BSDs, a Wayland or X11 display is set.
+#[cfg(feature = "wry-signin")]
+fn has_display() -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        return true;
+    }
+    ["WAYLAND_DISPLAY", "DISPLAY"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
 }
 
 #[cfg(test)]

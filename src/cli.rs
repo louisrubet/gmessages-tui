@@ -1,16 +1,17 @@
 //! Command-line options, parsed before touching session state.
 
 pub const USAGE: &str =
-    "gmessages-tui [--reset-login] [--manual | --qr] | --uninstall | --version | --help";
+    "gmessages-tui [--manual | --qr] | --unpair | --uninstall | --version | --help";
 
 pub const HELP: &str = "\
 gmessages-tui: Google Messages (RCS and SMS) in the terminal, paired with your Android phone.
 
 Options:
-  --reset-login  forget the pairing, then pair again
   --manual       pair from a page in your browser (cookies pasted from Google)
-  --qr           pair by QR code, for phones that still offer it
-  --uninstall    delete the store key from the keyring, the state and the cache
+  --qr           pair by QR code, scanned from Google Messages, for phones that still offer it
+  --unpair       unpair: your phone forgets this device, the session here is deleted (the
+                 messages stored stay); the next start pairs again. Also --reset-login
+  --uninstall    unpair, then delete the store key from the keyring, the state and the cache
   --version      print the version (with the commit, beyond the release)
   --help         show this help";
 
@@ -19,8 +20,8 @@ pub enum Command {
     Run {
         qr: bool,
         manual: bool,
-        reset_login: bool,
     },
+    Unpair,
     Version,
     Uninstall,
     Help,
@@ -39,23 +40,22 @@ pub fn parse<'a>(args: impl IntoIterator<Item = &'a str>) -> Result<Command, &'s
     if args == ["--uninstall"] {
         return Ok(Command::Uninstall);
     }
+    // --reset-login: its name up to 1.3.1.
+    if args == ["--unpair"] || args == ["--reset-login"] {
+        return Ok(Command::Unpair);
+    }
     #[cfg(feature = "wry-signin")]
     if args == ["--internal-google-signin"] {
         return Ok(Command::Signin);
     }
-    let mut mode = None;
-    let mut reset_login = false;
-    for arg in args {
-        match arg {
-            "--reset-login" if !reset_login => reset_login = true,
-            "--manual" | "--qr" if mode.is_none() => mode = Some(arg),
-            _ => return Err(USAGE),
-        }
-    }
+    let mode = match args[..] {
+        [] => None,
+        [mode @ ("--manual" | "--qr")] => Some(mode),
+        _ => return Err(USAGE),
+    };
     Ok(Command::Run {
         qr: mode == Some("--qr"),
         manual: mode == Some("--manual") || (mode.is_none() && !cfg!(feature = "wry-signin")),
-        reset_login,
     })
 }
 
@@ -64,50 +64,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reset_login_uses_default_signin() {
-        assert_eq!(
-            parse(["--reset-login"]),
-            Ok(Command::Run {
-                qr: false,
-                manual: !cfg!(feature = "wry-signin"),
-                reset_login: true,
-            })
-        );
+    fn unpair_and_its_old_name() {
+        assert_eq!(parse(["--unpair"]), Ok(Command::Unpair));
+        assert_eq!(parse(["--reset-login"]), Ok(Command::Unpair));
     }
 
     #[test]
-    fn reset_combines_with_pairing_modes_in_either_order() {
-        for args in [["--reset-login", "--manual"], ["--manual", "--reset-login"]] {
-            assert_eq!(
-                parse(args),
-                Ok(Command::Run {
-                    qr: false,
-                    manual: true,
-                    reset_login: true,
-                })
-            );
-        }
-        for args in [["--reset-login", "--qr"], ["--qr", "--reset-login"]] {
-            assert_eq!(
-                parse(args),
-                Ok(Command::Run {
-                    qr: true,
-                    manual: false,
-                    reset_login: true,
-                })
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_combinations_are_rejected_before_reset() {
+    fn invalid_combinations_are_rejected() {
         for args in [
             vec!["--qr", "--manual"],
-            vec!["--reset-login", "--version"],
-            vec!["--reset-login", "--unknown"],
-            vec!["--reset-login", "--internal-google-signin"],
-            vec!["--reset-login", "--reset-login"],
-            vec!["--uninstall", "--reset-login"],
+            vec!["--unpair", "--manual"],
+            vec!["--reset-login", "--qr"],
+            vec!["--unpair", "--unpair"],
+            vec!["--unpair", "--version"],
+            vec!["--unknown"],
+            vec!["--unpair", "--internal-google-signin"],
+            vec!["--uninstall", "--unpair"],
             vec!["--qr", "--uninstall"],
             vec!["--help", "--qr"],
         ] {
@@ -121,28 +93,26 @@ mod tests {
         assert_eq!(parse(["--uninstall"]), Ok(Command::Uninstall));
         assert_eq!(parse(["--help"]), Ok(Command::Help));
         assert_eq!(parse(["-h"]), Ok(Command::Help));
-        assert!(matches!(
+        assert_eq!(
             parse(std::iter::empty::<&str>()),
             Ok(Command::Run {
-                reset_login: false,
-                ..
+                qr: false,
+                manual: !cfg!(feature = "wry-signin"),
             })
-        ));
-        assert!(matches!(
+        );
+        assert_eq!(
             parse(["--qr"]),
             Ok(Command::Run {
                 qr: true,
-                reset_login: false,
-                ..
+                manual: false,
             })
-        ));
-        assert!(matches!(
+        );
+        assert_eq!(
             parse(["--manual"]),
             Ok(Command::Run {
+                qr: false,
                 manual: true,
-                reset_login: false,
-                ..
             })
-        ));
+        );
     }
 }

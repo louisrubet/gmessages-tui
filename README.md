@@ -38,7 +38,7 @@ gmessages-tui
 
 First run: sign in to the phone's Google account in the window that opens, then tap on your phone the emoji shown in the terminal. That's it: your conversations come in.
 
-Add `--no-default-features` to the install for a headless build without the sign-in window (pairing by pasting from a browser, see [options](#pairing-and-options)). The latest sources: `cargo install --locked --git https://github.com/louisrubet/gmessages-tui`; from a checkout: `cargo install --locked --path .`.
+No display (over SSH, in a container)? The sign-in window is skipped: pairing goes on from your browser (see [options](#pairing-and-options)). Add `--no-default-features` to the install for a headless build without the window at all. The latest sources: `cargo install --locked --git https://github.com/louisrubet/gmessages-tui`; from a checkout: `cargo install --locked --path .`.
 
 ## How it works
 
@@ -64,20 +64,22 @@ Google Messages has no public API. Like Google Messages for web, gmessages-tui n
 
 ## Pairing and options
 
-`gmessages-tui --reset-login` forgets the pairing and starts over. Also remove the old device from your phone (*Device pairing*).
+`gmessages-tui --unpair` unpairs: Google revokes this device, so your phone no longer lists it (*Device pairing*), and the session here is deleted; the messages stored stay, and the next start pairs again. (`--reset-login`, its name up to 1.3.1, does the same.)
 
-`gmessages-tui --manual` pairs from a page in your browser, when the window is unavailable or refused by Google (Firefox private window, Developer tools › Network › `config` › *Copy as cURL*, paste). `gmessages-tui --qr` pairs by QR code, for phones that still offer it.
+`gmessages-tui --manual` pairs from your browser: open the link printed in the terminal, sign in in a Firefox private window, then Developer tools › Network › `config` › *Copy as cURL*, and paste in the terminal or the page. It is also what happens when the sign-in window cannot open (no display), and the way out when Google refuses the window, or shows in it a captcha that cannot be read.
+
+`gmessages-tui --qr` pairs by QR code, for phones that still offer it: scan it with the scanner of Google Messages (*Device pairing* › *QR code scanner*), not with the camera, which only opens a Google help page. No scanner there? Use `--manual`.
 
 `gmessages-tui --version` prints the release version, `gmessages-tui --help` the options.
 
 ## Uninstall
 
 ```sh
-gmessages-tui --uninstall        # store key in the keyring, ~/.local/share/gmessages-tui, ~/.cache/gmessages-tui
-cargo uninstall gmessages-tui    # the program
+gmessages-tui --uninstall        # unpairs, then: store key in the keyring, ~/.local/share/gmessages-tui, ~/.cache/gmessages-tui
+cargo uninstall gmessages-tui    # the program (or with your package manager)
 ```
 
-`--uninstall` asks for confirmation. Also remove the device from your phone (*Device pairing*).
+`--uninstall` asks for confirmation. If Google could not be told, it says so: then remove the device from your phone (*Device pairing*).
 
 ## Terminal
 
@@ -143,8 +145,8 @@ The state holds the session (`session.json`: it gives access to your messages th
 - **No keyring** (headless Linux, SSH): a passphrase is asked at startup instead, or taken from `GMESSAGES_TUI_PASSPHRASE`.
 - **Files** are created readable by you only (Unix).
 - **Sign-in**: the window is private and saves no browser profile; once paired, the session is all that is kept.
-- **Reset**: `gmessages-tui --reset-login` removes the session, then pairs again. Also remove the old device from your phone: that is what revokes it.
-- **Uninstall**: `gmessages-tui --uninstall` deletes the keyring entry first, then the store and the rest of the state.
+- **Unpair**: `gmessages-tui --unpair` has Google revoke this device, then deletes the session. If Google cannot be told (offline), remove the device from your phone (*Device pairing*): that also revokes it.
+- **Uninstall**: `gmessages-tui --uninstall` unpairs, deletes the keyring entry, then the store and the rest of the state.
 - **Limits**: a program running in your session can read the unlocked keyring. Full disk encryption protects the rest of your machine.
 
 ## Upgrading from 1.2 and earlier
