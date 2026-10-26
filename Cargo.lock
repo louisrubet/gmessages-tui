@@ -539,8 +539,8 @@ dependencies = [
 
 [[package]]
 name = "chat-tui-core"
-version = "1.11.2"
-source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.11.2#369f0382d8c2909b90de35ffcac71427eedd399b"
+version = "1.11.3"
+source = "git+https://github.com/louisrubet/chat-tui-core?tag=v1.11.3#d28a9e2f38437689f3ef23f0eb08c81a7f5168d0"
 dependencies = [
  "arboard",
  "base64 0.22.1",
@@ -1681,7 +1681,7 @@ dependencies = [
 
 [[package]]
 name = "gmessages-tui"
-version = "1.3.2"
+version = "1.3.3"
 dependencies = [
  "base64 0.22.1",
  "chat-tui-core",
@@ -2908,7 +2908,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.45.0",
 ]
 
 [[package]]
