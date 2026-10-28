@@ -454,36 +454,45 @@ impl Sync {
         Some(Event::Chat(stored_discussion(gone)))
     }
 
-    /// A message arriving live: stored, then shown, as new (notified) unless known already or
-    /// old.
-    fn live(&self, conversation: String, m: phone::Message, old: bool) -> Event {
+    /// A message arriving live: stored, then shown, as new (notified) unless known already.
+    /// Old ones (replayed when the event stream opens again) are shown as history: those
+    /// received meanwhile, not known, are notified with the missed ones.
+    fn live(&mut self, conversation: String, m: phone::Message, old: bool) -> Vec<Event> {
+        let missed = old && self.is_missed(&m);
         let known = matches!(self.store.message(&m.id), Ok(Some(_)));
         // Deleted, and not known (or forgotten, e.g. not sent and sent again): nothing to show.
         if m.deleted && !known {
-            return Event::History {
+            return vec![Event::History {
                 chat: conversation,
                 messages: Vec::new(),
-            };
+            }];
         }
         let stored = self
             .store
             .save_messages(&conversation, std::slice::from_ref(&m))
             .and_then(|()| Ok(self.store.arrived(&conversation, &m.id)?));
         if let Err(e) = stored {
-            return Event::Status(format!("Cannot store the message: {e}"));
+            return vec![Event::Status(format!("Cannot store the message: {e}"))];
+        }
+        if missed {
+            self.missed.push((conversation.clone(), m.id.clone()));
         }
         let (message, quote) = message(m);
         if known || old {
-            Event::History {
+            let history = Event::History {
                 chat: conversation,
                 messages: vec![(message, quote)],
-            }
+            };
+            // While fetching, they are notified with those the fetches find.
+            let missed = (missed && self.fetching.is_empty())
+                .then(|| Event::Missed(std::mem::take(&mut self.missed)));
+            std::iter::once(history).chain(missed).collect()
         } else {
-            Event::Message {
+            vec![Event::Message {
                 chat: conversation,
                 message,
                 quote,
-            }
+            }]
         }
     }
 
@@ -527,6 +536,13 @@ impl Sync {
             .collect()
     }
 
+    /// Whether `m`, not stored yet, was received since the last message stored on start.
+    fn is_missed(&self, m: &phone::Message) -> bool {
+        self.stopped_ms.is_some_and(|stopped| {
+            !m.from_me && m.timestamp_ms > stopped && matches!(self.store.message(&m.id), Ok(None))
+        })
+    }
+
     /// Messages of `conversation`: stored (those received since the last start, not stored
     /// yet, missed), then as the interface shows them.
     fn history(
@@ -534,17 +550,12 @@ impl Sync {
         conversation: &str,
         messages: Vec<phone::Message>,
     ) -> Vec<(Message, Option<MessageId>)> {
-        if let Some(stopped) = self.stopped_ms {
-            let missed = messages.iter().filter(|m| {
-                !m.from_me
-                    && m.timestamp_ms > stopped
-                    && matches!(self.store.message(&m.id), Ok(None))
-            });
-            let missed: Vec<_> = missed
-                .map(|m| (conversation.to_string(), m.id.clone()))
-                .collect();
-            self.missed.extend(missed);
-        }
+        let missed: Vec<_> = messages
+            .iter()
+            .filter(|m| self.is_missed(m))
+            .map(|m| (conversation.to_string(), m.id.clone()))
+            .collect();
+        self.missed.extend(missed);
         if let Err(e) = self
             .store
             .save_messages(conversation, &messages)
@@ -760,7 +771,14 @@ fn events(
                     conversation,
                     message,
                     old,
-                } => sync.live(conversation, message, old),
+                } => {
+                    for event in sync.live(conversation, message, old) {
+                        if events.unbounded_send(event).is_err() {
+                            return;
+                        }
+                    }
+                    continue;
+                }
                 phone::Event::Gone { conversation } => match sync.gone(&conversation) {
                     Some(event) => event,
                     None => continue,
@@ -1190,4 +1208,78 @@ fn cache_dir() -> Option<std::path::PathBuf> {
         var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")))
     };
     base.map(|dir| dir.join(NAME))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(id: &str, ms: i64, from_me: bool) -> phone::Message {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "timestamp_ms": ms, "from_me": from_me, "sender_id": "2",
+            "sender": "Ann", "text": "",
+        }))
+        .unwrap()
+    }
+
+    fn missed(events: &[Event]) -> Option<Vec<MessageId>> {
+        events.iter().find_map(|e| match e {
+            Event::Missed(missed) => Some(missed.iter().map(|(_, id)| id.clone()).collect()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn replayed_messages_received_meanwhile_are_notified() {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "gmessages-sync-{:x}.db",
+            u64::from_ne_bytes(random)
+        ));
+        let store = Rc::new(store::Store::open(&path, "secret").unwrap());
+        let conversations: Vec<phone::Conversation> = serde_json::from_value(
+            serde_json::json!([{"id": "c", "name": "C", "group": false, "timestamp_ms": 1}]),
+        )
+        .unwrap();
+        store.save_conversations(&conversations).unwrap();
+        store
+            .save_messages("c", &[message("stored", 100, false)])
+            .unwrap();
+        let (commands, _sent) = phone::Commands::detached();
+        let mut sync = Sync {
+            store,
+            commands,
+            known: HashSet::new(),
+            read: HashSet::new(),
+            looked_up: HashSet::new(),
+            fetching: HashSet::new(),
+            stopped_ms: Some(100),
+            missed: Vec::new(),
+        };
+        let live = |sync: &mut Sync, id, ms, from_me, old| {
+            sync.live("c".to_string(), message(id, ms, from_me), old)
+        };
+
+        // Replayed, received meanwhile: shown, then notified.
+        let events = live(&mut sync, "new", 200, false, true);
+        assert!(matches!(events[0], Event::History { .. }));
+        assert_eq!(missed(&events), Some(vec!["new".to_string()]));
+        // Replayed again, ours, or older than the last one stored: only shown.
+        assert_eq!(missed(&live(&mut sync, "new", 200, false, true)), None);
+        assert_eq!(missed(&live(&mut sync, "mine", 300, true, true)), None);
+        assert_eq!(missed(&live(&mut sync, "older", 50, false, true)), None);
+        // Live: a message, notified as such.
+        let events = live(&mut sync, "live", 400, false, false);
+        assert!(matches!(events[..], [Event::Message { .. }]));
+
+        // While fetching: notified with those the fetch finds.
+        sync.fetching.insert("c".to_string());
+        assert_eq!(missed(&live(&mut sync, "during", 500, false, true)), None);
+        let fetched = sync.fetched("c", None).map(|e| vec![e]).unwrap_or_default();
+        assert_eq!(missed(&fetched), Some(vec!["during".to_string()]));
+
+        drop(sync);
+        let _ = std::fs::remove_file(&path);
+    }
 }

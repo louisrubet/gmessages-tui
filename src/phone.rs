@@ -385,6 +385,13 @@ impl Commands {
     pub fn send(&self, command: Command) -> bool {
         self.0.unbounded_send(command).is_ok()
     }
+
+    /// Commands going nowhere but to the receiver returned.
+    #[cfg(test)]
+    pub fn detached() -> (Self, futures::channel::mpsc::UnboundedReceiver<Command>) {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        (Commands(tx), rx)
+    }
 }
 
 /// What stops it.
@@ -421,6 +428,8 @@ struct Inner {
     pairing: bool,
     /// Active: the conversations are listed.
     ready: bool,
+    /// The event stream broke once ready, and has not opened again yet.
+    down: bool,
     /// Our participant ids: in conversations, and of the phone's SIMs.
     me: HashSet<String>,
     /// The conversations known, for the names of their participants and to send.
@@ -790,10 +799,23 @@ async fn follow(state: Rc<State>, mut events: gm::EventReceiver) {
             }
             gm::Event::PhoneNotResponding => state.status("The phone is not responding"),
             gm::Event::PhoneResponding => state.status("The phone is back"),
-            gm::Event::Disconnected { error, .. } => {
+            gm::Event::Disconnected { error, retry_in } => {
                 log::warn(&format!("disconnected: {error}"));
-                if !state.inner.borrow().ready {
+                let ready = state.inner.borrow().ready;
+                if ready {
+                    state.inner.borrow_mut().down = true;
+                    state.status(format!(
+                        "Disconnected from Google Messages, retrying in {} s",
+                        retry_in.as_secs()
+                    ));
+                } else {
                     state.status("Google Messages is not answering, retrying\u{2026}");
+                }
+            }
+            gm::Event::Connected => {
+                let down = std::mem::take(&mut state.inner.borrow_mut().down);
+                if down {
+                    state.status("Reconnected to Google Messages");
                 }
             }
             gm::Event::LoggedOut(reason) => {
